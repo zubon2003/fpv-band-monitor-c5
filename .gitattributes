@@ -1,0 +1,8 @@
+# Windows launchers need CRLF; macOS/shell scripts need LF.
+*.bat     text eol=crlf
+*.command text eol=lf
+*.sh      text eol=lf
+*.py      text eol=lf
+*.md      text eol=lf
+*.toml    text eol=lf
+*.txt     text eol=lf
