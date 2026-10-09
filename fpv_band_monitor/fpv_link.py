@@ -83,7 +83,14 @@ class FpvLink:
         self._pending: list[tuple] = []
         try:
             self.ser.reset_input_buffer()
-            self.hello = self.ask("FPV?", expect="FPV ")
+            try:
+                self.hello = self.ask("FPV?", expect="FPV ")
+            except FpvLinkError as e:
+                # a stale ERR from the previous session can arrive first
+                # (Windows USB CDC); ask once more
+                if "ERR" not in str(e):
+                    raise
+                self.hello = self.ask("FPV?", expect="FPV ")
         except Exception:
             self.close()
             raise
@@ -164,6 +171,7 @@ class FpvLink:
             if self.ser.is_open:
                 try:
                     self._send("FPV STREAM OFF")
+                    self.ser.flush()    # closing mid-write leaves a broken line on Windows
                 except Exception:
                     pass
                 self.ser.close()
