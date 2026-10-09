@@ -56,7 +56,7 @@ class EspSdrError(RuntimeError):
 @dataclass
 class EspSettings:
     port: str | None = None     # None = first Espressif USB device found
-    gain: int = 40              # manual gain-table index; -1 = hardware AGC
+    gain: int = 25              # manual gain-table index; -1 = hardware AGC
     rate_index: int = 0         # 0 = 80 MS/s
     bits: int = 10              # 8 (CAP16) or 10 (CAP20)
     samples: int = 8192         # per hop, max 16380

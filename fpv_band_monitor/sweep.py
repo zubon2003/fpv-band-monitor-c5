@@ -111,7 +111,7 @@ class SweepSettings:
     start_mhz: float
     stop_mhz: float
     bin_hz: int = 100_000
-    gain: int = 40              # ESP32 gain-table index; -1 = hardware AGC
+    gain: int = 25              # ESP32 gain-table index; -1 = hardware AGC
     port: str | None = None     # COM port; None = first Espressif USB device
 
 

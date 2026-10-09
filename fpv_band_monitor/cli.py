@@ -38,8 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"監視するチャンネル。カンマ区切り (既定 {DEFAULT_CHANNELS})。"
                         "MHz の数字や 名前@MHz も可。一覧は --list-channels")
     g.add_argument("--port", help="COM ポート (省略時は Espressif の USB を自動検出)")
-    g.add_argument("--gain", type=int, default=40,
-                   help="ゲイン (内部テーブル番号、dB ではない。既定 40)。"
+    g.add_argument("--gain", type=int, default=25,
+                   help="ゲイン (内部テーブル番号、dB ではない。既定 25)。"
                         "近くの VTX で山が横に広がるときは下げる (C5 実測: 55 以上で飽和)")
     g.add_argument("--config", metavar="PATH",
                    help="設定ファイル (既定 band_monitor.toml、無ければ使わない)")
