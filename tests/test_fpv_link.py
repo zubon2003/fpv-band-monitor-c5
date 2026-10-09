@@ -87,7 +87,7 @@ class TestFpvLink(unittest.TestCase):
         m, s, path = pty()
         dev = Fake(m, db)
         dev.start()
-        es = EspSettings(backend="fw", channels=(("E2", 5685), ("E1", 5705), ("F3", 5780), ("F5", 5820), ("F1", 5740)))
+        es = EspSettings(channels=(("E2", 5685), ("E1", 5705), ("F3", 5780), ("F5", 5820), ("F1", 5740)))
         st = SweepSettings(start_mhz=5670.0, stop_mhz=5835.0, bin_hz=78125, gain=40, port=path)
         stop = threading.Event()
         lines = []

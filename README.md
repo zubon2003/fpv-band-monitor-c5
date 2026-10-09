@@ -1,21 +1,20 @@
 # fpv-band-monitor-c5
 
-**ESP32-C5** で FPV 5.8GHz の 4 波（既定は **E2 / E1 / F3 / F5**）を監視するバンドモニタ。
-**アナログ FPV の映像電波（FM-ATV）専用**。
-HackRF One 版の fpv-band-monitor から C5 専用に切り出したもの。
-解析（重心による中心周波数、SNR による在り判定）と GUI は同じ。
+**XIAO ESP32-C5** の液晶版バンドモニタ・ファームから掃引を受け取り、FPV 5.8GHz の 4 波（既定は **E2 / E1 / F3 / F5**）を
+PC で監視するバンドモニタ。**アナログ FPV の映像電波（FM-ATV）専用**。
+ホップ・FFT・つなぎ合わせはチップ上で済ませてあり、PC は掃引 1 回分（4CH で約 4 KB）を USB で受け取るだけなので、
+I/Q を PC に送っていた頃のような USB 転送の待ちが無い。液晶側でも同じ掃引を表示し続ける。
+解析（重心による中心周波数、SNR による在り判定）と GUI は HackRF One 版の fpv-band-monitor と同じ。
 
 - スペクトラム + ウォーターフォール、9MHz / 15MHz の帯域幅マーク
 - 各チャンネルの **実測中心周波数** をリアルタイム表示
 
 ## 必要なもの
 
-- **ESP32-C5** の基板（例: ESP32-C5-DevKitC-1）。5GHz 帯を受けられる ESP32 は C5 だけ
-  （C3/C6/S3 などは 2.4GHz のみ）
-- [ESP-SDR](https://github.com/ESPARGOS/esp-sdr) ファームウェア
+- **XIAO ESP32-C5** に **液晶版バンドモニタのファーム**（ESP-SDR に液晶モニタを組み込んだもの）を書いたもの。
+  液晶はつながっていなくても PC から使える。通常の ESP-SDR ファームには対応していない
 - Python 3.11 以上（3.13 推奨）。Windows は [python.org](https://www.python.org/downloads/)、
-  Mac は python.org のインストーラーか `brew install python@3.13`
-  （Mac 標準の `/usr/bin/python3` は 3.9 のことが多く使えない）
+Mac は python.org のインストーラーか `brew install python@3.13` （Mac 標準の `/usr/bin/python3` は 3.9 のことが多く使えない）
 
 ## インストール
 
@@ -30,20 +29,18 @@ HackRF One 版の fpv-band-monitor から C5 専用に切り出したもの。
 
 ### ファームウェアの書き込み
 
-ブラウザ（Chrome / Edge）の [firmware installer](https://espargos.net/espsdr/app/flash.html) で
-ESP32-C5 を選ぶのが簡単。esptool を使う場合は
-[esp-web-sdr](https://github.com/ESPARGOS/esp-web-sdr) の `firmware/` で:
+液晶版ファームの配布物にある `firmware/fpv-lcd-xiao-c5-merged.bin` を **オフセット 0x0** に書く:
 
-```powershell
-python -m esptool --chip esp32c5 --port COMx write-flash @esp32c5/flash_args
+```
+python -m esptool --chip esp32c5 write-flash 0x0 fpv-lcd-xiao-c5-merged.bin
 ```
 
-（ESP-SDR にはライセンス表記が無いので、バイナリはこのリポジトリに同梱していない）
+（ブラウザなら [ESP Tool](https://espressif.github.io/esptool-js/) で Flash Address 0x0 に指定）
 
 ## 使い方
 
-C5 の **ネイティブ USB 側の端子**を PC に挿す（VID 303A のポートを自動で探す）。
-ブラウザの ESP-WebSDR など、ポートを掴む他のプログラムは閉じておく。
+XIAO ESP32-C5 の USB を PC に挿す（VID 303A のポートを自動で探す）。
+ポートを掴む他のプログラム（シリアルモニタなど）は閉じておく。
 
 | Windows | Mac | 内容 |
 | --- | --- | --- |
@@ -80,22 +77,15 @@ C5 の **ネイティブ USB 側の端子**を PC に挿す（VID 303A のポー
 - ダウンロードしたファイルが開けないと言われたら、右クリック →「開く」
 - ポート名は `/dev/cu.usbmodem…` の形。画面の Port 欄から選べる
 
-## 液晶版ファームとの接続（掃引ストリーム）
+## 液晶版ファームとのやりとり
 
-XIAO ESP32-C5 の液晶版ファーム（ESP-SDR に液晶モニタを組み込んだもの）は、チップ上で FFT とつなぎ合わせを済ませた
-**掃引を 1 回ごとに USB で送れる**。I/Q を送る従来方式（1 ホップ約 20 KB）に比べ、4CH の掃引 1 回が約 4 KB で済むので、
-USB の転送待ちが無くなる。液晶側でも同じ掃引を表示し続ける。
-
-| `--receiver` | 動作 |
-|---|---|
-| `auto`（既定） | 起動時に `FPV?` を送り、液晶版ファームなら `fw`、通常の ESP-SDR なら `iq` |
-| `fw` | 掃引ストリームを受け取る。ビン幅はファームと同じ 78.125 kHz。平均・重心・判定は従来どおり PC で行う |
-| `iq` | 従来どおり I/Q を受け取って PC で FFT（液晶版ファームでもこちらは使える。その間、液晶の掃引は止まる） |
-
-`fw` では、PC のスパンとチャンネル（最大 4）を液晶にも送り、液晶は「PC」モードで同じものを表示する。
-Span ボタンで 1 チャンネル表示にすると液晶も同じスパンになる。ゲインも PC の値が送られる。
-コマンドとフレームの形式は液晶版ファームの `main/fpv/link.h` にある。
+- 起動時に `FPV?` でファームを確かめ、PC のスパン・チャンネル（最大 4）・ゲインを送ってから掃引を受け取る。
+  液晶は「PC」モードになり、PC と同じものを表示する。Span ボタンで 1 チャンネル表示にすると液晶も同じスパンになる。
+- スペクトラムのビン幅はファームの FFT と同じ 78.125 kHz（80 MS/s ÷ 1024）。
+- 液晶側でモードを変えると、PC は別スパンの掃引が 5 回続いたところで自分のスパンを送り直す（PC が優先）。
+- 送られる値は 0.01 dB 単位（誤差 0.005 dB 以内）。平均・重心・判定はこれまでどおり PC で行う。
+- コマンドとフレームの形式は液晶版ファームの `main/fpv/link.h`。
 
 ## ライセンス
 
-MIT License（[LICENSE](LICENSE)）。ESP-SDR ファームウェアは別プロジェクト（同梱していない）。
+MIT License（[LICENSE](LICENSE)）。液晶版ファーム（ESP-SDR ベース、GPL-3.0）は別配布（同梱していない）。

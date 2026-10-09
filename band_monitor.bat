@@ -1,6 +1,6 @@
 @echo off
 rem ==========================================================
-rem  FPV band monitor - ESP32-C5 (ESP-SDR firmware), GUI
+rem  FPV band monitor - ESP32-C5 (LCD band-monitor firmware), GUI
 rem  Uses the Python in .venv (made by install.bat).
 rem  Extra arguments are passed through, e.g.
 rem    band_monitor.bat --channels R1,R4,F2,E1 --gain 55

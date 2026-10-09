@@ -1,6 +1,6 @@
 """Sweep plumbing: frequency grid, frames and the reader thread.
 
-The ESP32-C5 source (esp_sdr.esp_source) stitches its hops itself and yields
+The ESP32-C5 source (fpv_link.fw_source; esp_sdr.esp_source for --sim) yields
 one SpanLine per finished sweep. SweepAccumulator paints it onto the fixed
 display grid and SweepReader turns it into a Frame on a queue for the GUI/CLI.
 """

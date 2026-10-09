@@ -1,10 +1,9 @@
 """Finished sweeps from the LCD band-monitor firmware ("FPV" protocol).
 
 The XIAO ESP32-C5 LCD firmware (ESP-SDR + main/fpv) hops, FFTs and stitches
-on the chip and can stream every finished sweep over USB: about 4 kB per
-sweep instead of 20 kB of raw I/Q per hop, so the PC is no longer limited by
-the serial link. The same firmware still answers the stock ESP-SDR I/Q
-protocol, so ``--receiver iq`` keeps working with it.
+on the chip and streams every finished sweep over USB: about 4 kB per sweep
+instead of 20 kB of raw I/Q per hop, so the PC is not limited by the serial
+link. This is the monitor's only receiver.
 
 Wire format (see main/fpv/link.h in the firmware):
 
@@ -209,3 +208,40 @@ def fw_source(es, link_factory=None):
             link.close()
 
     return source
+
+
+def probe(port: str | None, start_mhz: float, stop_mhz: float, channels, gain: int,
+          seconds: float = 5.0) -> int:
+    """--info: who answers, its state, and 5 s of the stream."""
+    from .esp_sdr import list_port_lines
+    print("serial ports:")
+    for line in list_port_lines():
+        print("  " + line)
+    try:
+        link = FpvLink(port)
+    except FpvLinkError as e:
+        print(f"\n{e}\n(the LCD firmware answers 'FPV?'; is it flashed and is the port free?)")
+        return 1
+    try:
+        print(f"\nport {link.port}: {link.hello}")
+        print(link.ask("FPV STATE?", expect="STATE"))
+        link.configure(start_mhz, stop_mhz, channels, gain)
+        link.stream(True)
+        t0 = time.monotonic()
+        n, floors, last_t = 0, [], None
+        while time.monotonic() - t0 < seconds:
+            fr = link.next_sweep()
+            if fr is None:
+                continue
+            n += 1
+            db = fr[3]
+            floors.append(float(np.nanmedian(db)))
+        dt = time.monotonic() - t0
+        print(f"\n{n} sweeps in {dt:.1f} s -> {n / dt:.2f} sweeps/s, "
+              f"{link.bad_frames} bad frames")
+        if floors:
+            print(f"floor (median of a sweep): {np.median(floors):.1f} dB")
+        print(link.ask("FPV STATE?", expect="STATE"))
+    finally:
+        link.close()
+    return 0
