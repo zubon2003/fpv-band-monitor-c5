@@ -47,7 +47,7 @@ C5 の **ネイティブ USB 側の端子**を PC に挿す（VID 303A のポー
 
 | Windows | Mac | 内容 |
 | --- | --- | --- |
-| `band_monitor.bat` | `band_monitor.command` | GUI 起動。引数はそのまま渡る（例: `band_monitor.bat --gain 55`）|
+| `band_monitor.bat` | `band_monitor.command` | GUI 起動（`--nolcd` 付き = No LCD オン）。引数はそのまま渡る（例: `band_monitor.bat --gain 55`）|
 | `band_monitor_sim.bat` | `band_monitor_sim.command` | 疑似 C5 で動作確認（ハード不要）|
 | `band_monitor_headless.bat` | `band_monitor_headless.command` | GUI 無し、コンソールに実測中心を表示 |
 | `check_esp.bat` | `check_esp.command` | 接続確認: ファームウェアの応答、ゲイン別 ADC レベル、ホップの所要時間、ホップ内のノイズ形状 |
@@ -71,10 +71,11 @@ C5 の **ネイティブ USB 側の端子**を PC に挿す（VID 303A のポー
   （numpy 2.4.3、PyQt6 6.10.2、PyQt6-Qt6 6.10.2、PyQt6-sip 13.11.0、pyqtgraph 0.14.0、
   colorama 0.4.6、pyserial 3.5）がすべて入る
 - `band_monitor.bat` から `.venv` の Python で起動し、疑似 C5 で受信用の子プロセスも含めて正常に動く
+- 液晶版ファームを書いた XIAO ESP32-C5 の実機で `fft` / `iq` / No LCD を確認（2026-10-09）
 
-**Mac（未確認）**
+**Mac（確認済み、2026-10-10）**
 
-- `.command` の 5 ファイルは、改行コード（LF）と bash の構文チェックまで確認。Mac 実機ではまだ動かしていない
+- Mac 実機で動作を確認
 - 初回はターミナルで `bash install.command`（Windows からコピーしたファイルは実行権限が外れているため）。
   インストール時に他の `.command` に実行権限を付けるので、以後はダブルクリックで起動できる
 - ダウンロードしたファイルが開けないと言われたら、右クリック →「開く」
@@ -100,7 +101,9 @@ Span ボタンで 1 チャンネル表示にすると液晶も同じスパンに
 
 **No LCD**（チェックボックス、または `--nolcd`）: `fft` のとき `FPV NOLCD` を送り、液晶を消してチップは掃引と FFT だけを全力で行う
 （描画の分だけ掃引が速くなる）。受信をやめる（Disconnect・終了・USB が切れる）、チェックを外す、液晶をタップする、のどれかで表示が戻る。
-`iq` では使えない（灰色）。
+`iq` では使えない（灰色）。起動ファイル（`band_monitor.bat` / `.command`）は `--nolcd` 付きで起動するので、最初からオンになっている。
+
+`fft` ではウォーターフォールを掃引 1 回ごとに 1 行進める（時間軸は実測の掃引間隔から決める）。`iq` では従来どおり `--wf-row-ms` ごとに 1 行。
 
 コマンドとフレームの形式は液晶版ファームの `main/fpv/link.h` にある。
 
