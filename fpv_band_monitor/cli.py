@@ -80,8 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="-3dB 幅がこれ未満なら信号なし扱い MHz (既定 0=無効)")
 
     g = p.add_argument_group("表示")
-    g.add_argument("--bw-marks", default="9,15",
-                   help="チャンネルの周りに描く帯域幅 MHz、カンマ区切り (既定 9,15)")
+    g.add_argument("--bw-marks", default="9,17",
+                   help="チャンネルの周りに描く帯域幅 MHz、カンマ区切り (既定 9,17)")
     g.add_argument("--y-range", metavar="LO:HI",
                    help="スペクトラム縦軸を固定 (例 -90:-20)。省略時は自動")
     g.add_argument("--waterfall-rows", type=int, default=400,

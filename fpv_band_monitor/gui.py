@@ -43,7 +43,7 @@ def _lut() -> np.ndarray:
 
 @dataclass
 class ViewOptions:
-    bw_marks_mhz: tuple[float, ...] = (9.0, 15.0)
+    bw_marks_mhz: tuple[float, ...] = (9.0, 17.0)
     search_mhz: float = 8.0
     min_snr_db: float = 18.0
     noise_margin_db: float = 3.0
