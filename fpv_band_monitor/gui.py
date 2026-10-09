@@ -320,6 +320,8 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         self._image_placed = False
         self._row_t: float | None = None
         self.sweep_period = 0.05
+        self._period_fresh = True       # take the first interval as is
+        self._placed_period = 0.0
         self._last_frame_t: float | None = None
         self._frames = 0
         self._csv = None
@@ -750,8 +752,19 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hint"):
             self.hint.setVisible(self.width() >= 900)
 
+    def _row_per_sweep(self) -> bool:
+        """fft (the LCD firmware's own sweeps, a few per second): one
+        waterfall row per sweep instead of one per waterfall_row_ms."""
+        rc = self.opts.receiver
+        return rc is not None and not self.simulated and rc.backend == "fft"
+
+    def _row_period(self) -> float:
+        if self._row_per_sweep():
+            return self.sweep_period
+        return self.opts.waterfall_row_ms / 1000.0
+
     def _wf_seconds(self) -> float:
-        return self.opts.waterfall_rows * self.opts.waterfall_row_ms / 1000.0
+        return self.opts.waterfall_rows * self._row_period()
 
     def _place_image(self) -> None:
         """Map the image onto MHz / seconds. Only works once it has data:
@@ -759,6 +772,8 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         span = self.grid.stop_mhz - self.grid.start_mhz
         total = self._wf_seconds()
         self.img.setRect(QtCore.QRectF(self.grid.start_mhz, -total, span, total))
+        self.p_wf.setYRange(-total, 0, padding=0)
+        self._placed_period = self._row_period()
         self._image_placed = True
 
     # ------------------------------------------------------------- reader --
@@ -785,6 +800,10 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         self._stop_reader()
         if resolve:
             self._resolve_receiver()
+        # the sweep rate changes with the receiver (iq / fft, LCD on / off)
+        self._last_frame_t = None
+        self._period_fresh = True
+        self._image_placed = False
         self._start_reader()
 
     # ----------------------------------------------------------- receiver --
@@ -849,6 +868,7 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         self._row_t = None
         self._wf_top = None
         self._last_frame_t = None
+        self._period_fresh = True
         self.averager.reset()
         self.smoother = Smoother(self.opts.smooth_alpha)
         self.peak_hold = None
@@ -982,16 +1002,25 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         if not frames or self.paused:
             return
 
+        per_sweep = self._row_per_sweep()
         for fr in frames:
             if self._last_frame_t is not None:
                 dt = fr.t - self._last_frame_t
                 if 0.0005 < dt < 5.0:
-                    self.sweep_period += 0.1 * (dt - self.sweep_period)
+                    if self._period_fresh:
+                        self.sweep_period = dt
+                        self._period_fresh = False
+                    else:
+                        self.sweep_period += 0.1 * (dt - self.sweep_period)
             self._last_frame_t = fr.t
-            # One waterfall row per waterfall_row_ms, holding the peak of the
-            # sweeps that fell in it: a short burst cannot slip between rows.
             row = np.nan_to_num(fr.powers, nan=-120.0, posinf=-120.0,
                                 neginf=-120.0)
+            if per_sweep:
+                self.wf[:-1] = self.wf[1:]
+                self.wf[-1] = row
+                continue
+            # One waterfall row per waterfall_row_ms, holding the peak of the
+            # sweeps that fell in it: a short burst cannot slip between rows.
             self._row_accum = (row if self._row_accum is None
                                else np.fmax(self._row_accum, row))
             period = self.opts.waterfall_row_ms / 1000.0
@@ -1005,6 +1034,10 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
                 self._row_t = fr.t
                 self._row_accum = None
         self._frames += len(frames)
+        # the time axis follows the measured sweep rate
+        if (per_sweep and self._image_placed
+                and abs(self.sweep_period - self._placed_period) > 0.1 * self._placed_period):
+            self._place_image()
 
         latest = frames[-1]
         self.last_powers = latest.powers
