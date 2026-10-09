@@ -92,6 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ホップの LO 位置の点線を消す")
 
     g = p.add_argument_group("受信機 (上級)")
+    g.add_argument("--receiver", choices=("auto", "iq", "fw"), default="auto",
+                   help="auto: 液晶版ファームならスペクトラム受信 (fw)、ESP-SDR なら I/Q 受信 (iq)。"
+                        "fw はチップ上で FFT 済みの掃引を受け取る (USB 転送が少なく速い、"
+                        "ビン幅 78.125 kHz)。iq は従来どおり PC で FFT")
     g.add_argument("--margin-mhz", type=float, default=15.0,
                    help="掃引範囲を端のチャンネルの外へ広げる幅 MHz。Span ボタンの "
                         "1 チャンネル表示もこの ±幅 (既定 15)")
@@ -141,10 +145,29 @@ def load_config(path: Path, parser: argparse.ArgumentParser) -> dict:
 
 def _esp_settings(args) -> EspSettings:
     # 80 MS/s, IQ10, min-combine, no flip: the settings checked on the C5.
+    chans = tuple((c.name, c.freq_mhz) for c in parse_channels(args.channels))
     return EspSettings(port=args.port, gain=args.gain, samples=args.samples,
                        bandwidth_mhz=args.bandwidth,
                        step_mhz=args.step, usable_mhz=args.usable,
-                       dc_khz=args.dc_khz)
+                       dc_khz=args.dc_khz,
+                       backend=getattr(args, "backend", "iq"), channels=chans)
+
+
+def _choose_receiver(args) -> None:
+    """Settle args.backend; fw sweeps come on the firmware's 78.125 kHz grid."""
+    args.backend = "iq"
+    if args.sim or args.receiver == "iq":
+        return
+    from .fpv_link import detect_firmware
+    if args.receiver == "fw" or detect_firmware(args.port):
+        args.backend = "fw"
+        # The firmware hops like this monitor (25 MHz steps, +-28 MHz kept) but
+        # FFTs 1024 points: build the display grid on the same bins.
+        args.bin_khz = 78.125
+        args.step = 25
+        print("受信: 液晶版ファームの掃引ストリーム (fw)")
+    elif args.receiver == "auto":
+        print("受信: ESP-SDR の I/Q (iq)")
 
 
 def _span(args, channels) -> tuple[float, float]:
@@ -250,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         return esp_probe(_esp_settings(args), start, stop,
                          int(round(args.bin_khz * 1000)))
 
+    _choose_receiver(args)
     channels, settings, grid, los = _grid_and_settings(args)
     source_factory = _source_factory(args, channels)
     args.search_mhz = auto_search_halfwidth(channels, args.search_mhz)
