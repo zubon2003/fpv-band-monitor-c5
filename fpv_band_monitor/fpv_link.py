@@ -4,7 +4,9 @@ The XIAO ESP32-C5 LCD firmware (ESP-SDR + main/fpv) hops, FFTs and stitches
 on the chip and can stream every finished sweep over USB: about 4 kB per
 sweep instead of 20 kB of raw I/Q per hop, so the PC is no longer limited by
 the serial link. The same firmware still answers the stock ESP-SDR I/Q
-protocol, so ``--receiver iq`` keeps working with it.
+protocol, so ``--receiver iq`` keeps working with it; ``--receiver auto``
+(the default) takes the stream when the device answers ``FPV?`` and falls
+back to I/Q otherwise.
 
 Wire format (see main/fpv/link.h in the firmware):
 
@@ -12,6 +14,8 @@ Wire format (see main/fpv/link.h in the firmware):
     FPV SPAN <a> <b> [chs]  -> OK        sweep a..b MHz, show chs on the LCD
     FPV GAIN <n|AGC>        -> OK
     FPV STREAM ON|OFF       -> OK
+    FPV NOLCD | FPV LCD     -> OK        LCD off: the chip only sweeps (faster);
+                                         ends with STREAM OFF or a tap
     SWEEP <seq> <start_mhz> <nbins> <bin_hz> <t_ms> <crc32>\\n + nbins x uint16
           (dB = code / 100 - 200, 0xFFFF = no data)
 """
@@ -141,6 +145,9 @@ class FpvLink:
     def stream(self, on: bool) -> None:
         self.ask("FPV STREAM ON" if on else "FPV STREAM OFF")
 
+    def lcd(self, on: bool) -> None:
+        self.ask("FPV LCD" if on else "FPV NOLCD")
+
     def next_sweep(self):
         """The next frame as (seq, start_mhz, bin_hz, db), or None on a timeout."""
         if self._pending:
@@ -188,6 +195,8 @@ def fw_source(es, link_factory=None):
             yield DeviceInfo(link.port, link.hello)
             link.configure(s.start_mhz, s.stop_mhz, es.channels, s.gain)
             link.stream(True)
+            if getattr(es, "nolcd", False):
+                link.lcd(False)     # the firmware turns it back on at STREAM OFF
             want = int(np.floor(s.start_mhz))
             foreign = 0
             while not stop.is_set():
@@ -201,6 +210,8 @@ def fw_source(es, link_factory=None):
                     foreign += 1
                     if foreign >= 5:
                         link.configure(s.start_mhz, s.stop_mhz, es.channels, s.gain)
+                        if getattr(es, "nolcd", False):
+                            link.lcd(False)
                         foreign = 0
                     continue
                 foreign = 0
@@ -209,3 +220,41 @@ def fw_source(es, link_factory=None):
             link.close()
 
     return source
+
+
+def probe(port: str | None, start_mhz: float, stop_mhz: float, channels, gain: int,
+          seconds: float = 5.0, nolcd: bool = False) -> int:
+    """--info for the fft receiver: who answers, its state, 5 s of the stream."""
+    from .esp_sdr import list_port_lines
+    print("serial ports:")
+    for line in list_port_lines():
+        print("  " + line)
+    try:
+        link = FpvLink(port)
+    except FpvLinkError as e:
+        print(f"\n{e}\n(the LCD firmware answers 'FPV?'; is it flashed and is the port free?)")
+        return 1
+    try:
+        print(f"\nport {link.port}: {link.hello}")
+        print(link.ask("FPV STATE?", expect="STATE"))
+        link.configure(start_mhz, stop_mhz, channels, gain)
+        link.stream(True)
+        if nolcd:
+            link.lcd(False)
+        t0 = time.monotonic()
+        n, floors = 0, []
+        while time.monotonic() - t0 < seconds:
+            fr = link.next_sweep()
+            if fr is None:
+                continue
+            n += 1
+            floors.append(float(np.nanmedian(fr[3])))
+        dt = time.monotonic() - t0
+        print(f"\n{n} sweeps in {dt:.1f} s -> {n / dt:.2f} sweeps/s"
+              f"{' (LCD off)' if nolcd else ''}, {link.bad_frames} bad frames")
+        if floors:
+            print(f"floor (median of a sweep): {np.median(floors):.1f} dB")
+        print(link.ask("FPV STATE?", expect="STATE"))
+    finally:
+        link.close()
+    return 0

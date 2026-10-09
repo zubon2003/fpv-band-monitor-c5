@@ -61,6 +61,7 @@ class ViewOptions:
     hop_los_mhz: tuple = ()
     # Span buttons: (start, stop) MHz -> (grid, hop LOs); None hides them.
     span_planner: Callable | None = None
+    receiver: object | None = None      # cli.ReceiverControl: auto / iq / fft
     channel_span_half_mhz: float = 15.0  # one-channel span = centre +- this
     y_auto: bool = True         # spectrum dBm axis follows the noise floor
     y_min_dbm: float = -100.0
@@ -442,6 +443,37 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         self.conn_label.setMinimumWidth(150)
         self._refresh_ports()
 
+        # Receiver: auto (FFT'd sweeps from the LCD firmware if it answers,
+        # else I/Q), iq (FFT here), fft (the firmware's sweeps). No LCD: in
+        # fft, the chip stops drawing and only sweeps.
+        rc = self.opts.receiver
+        self.rx_group = QtWidgets.QButtonGroup(self)
+        self.rx_group.setExclusive(True)
+        self.rx_buttons = {}
+        for name, tip in (("auto", "LCD firmware -> fft, otherwise iq"),
+                          ("iq", "raw I/Q, FFT on the PC (any ESP-SDR firmware)"),
+                          ("fft", "finished sweeps from the LCD firmware "
+                                  "(78.125 kHz bins, less USB traffic)")):
+            b = QtWidgets.QPushButton(name)
+            b.setCheckable(True)
+            b.setMinimumWidth(40)
+            b.setToolTip(tip)
+            b.setStyleSheet("QPushButton:checked { background: #d8d8e4;"
+                            " color: #101018; font-weight: bold; }")
+            b.setChecked(rc is not None and rc.choice == name)
+            b.clicked.connect(lambda _=False, n=name: self._select_receiver(n))
+            self.rx_group.addButton(b)
+            self.rx_buttons[name] = b
+        self.rx_label = QtWidgets.QLabel("")
+        self.rx_label.setMinimumWidth(36)
+        self.chk_nolcd = QtWidgets.QCheckBox("No LCD")
+        self.chk_nolcd.setToolTip(
+            "fft only: the LCD goes dark and the chip spends every cycle "
+            "sweeping (a tap on the screen brings it back)")
+        self.chk_nolcd.setChecked(rc is not None and rc.nolcd)
+        self.chk_nolcd.toggled.connect(self._set_nolcd)
+        self._show_receiver()
+
         # One PHY gain-table index; -1 hands gain to the chip's AGC.
         self.spin_gain = QtWidgets.QSpinBox()
         self.spin_gain.setRange(-1, 127)
@@ -543,8 +575,12 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
                 span_widgets.append(b)
             span_widgets.append(label("|"))
 
+        rx_widgets = []
+        if rc is not None:
+            rx_widgets = [label("Rx"), *self.rx_buttons.values(), self.rx_label,
+                          self.chk_nolcd, label("|")]
         for w in (label("Port"), self.cmb_port, self.btn_connect,
-                  self.conn_label, label("|"),
+                  self.conn_label, label("|"), *rx_widgets,
                   *span_widgets, label("Gain idx"), self.spin_gain, btn_apply,
                   self.btn_pause, self.chk_hold, btn_clear, self.chk_hops,
                   label("| detect SNR >="), self.spin_snr,
@@ -556,7 +592,8 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         bar.addWidget(hint)
         bar.addWidget(self.status)
         if self.simulated:
-            for w in (self.spin_gain, btn_apply, self.cmb_port):
+            for w in (self.spin_gain, btn_apply, self.cmb_port, self.chk_nolcd,
+                      *self.rx_buttons.values()):
                 w.setEnabled(False)
         return bar
 
@@ -609,7 +646,7 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         else:
             self._want_connected = True
             self.settings.port = self.cmb_port.currentData()
-            self._restart_reader()
+            self._restart_reader(resolve=True)
 
     def _disconnect(self, text: str, state: str = "disconnected",
                     tip: str = "") -> None:
@@ -734,28 +771,7 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
                                   self.source_factory(self.settings), self.queue)
         self.reader.start()
 
-    def _restart_reader(self) -> None:
-        if self.reader is not None:
-            self.reader.stop()
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
-        self._start_reader()
-
-    def _select_span(self, name: str) -> None:
-        """Sweep one channel (centre +- margin) or ALL (the starting span)."""
-        if name == self._span_name:
-            return
-        if name == "ALL":
-            start, stop = self._full_span
-        else:
-            ch = next(c for c in self.channels if c.name == name)
-            half = self.opts.channel_span_half_mhz
-            start, stop = ch.freq_mhz - half, ch.freq_mhz + half
-        self._span_name = name
-
+    def _stop_reader(self) -> None:
         if self.reader is not None:
             self.reader.stop()
             self.reader = None
@@ -765,6 +781,62 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
             except queue.Empty:
                 break
 
+    def _restart_reader(self, resolve: bool = False) -> None:
+        self._stop_reader()
+        if resolve:
+            self._resolve_receiver()
+        self._start_reader()
+
+    # ----------------------------------------------------------- receiver --
+    def _show_receiver(self) -> None:
+        rc = self.opts.receiver
+        if rc is None:
+            return
+        self.rx_label.setText("-> " + rc.backend if rc.choice == "auto" else "")
+        self.rx_label.setToolTip(f"receiving: {rc.label()}")
+        self.chk_nolcd.setEnabled(not self.simulated and rc.backend == "fft")
+
+    def _resolve_receiver(self) -> None:
+        """Settle auto/iq/fft on the port (the reader is stopped: the port is
+        free for the FPV? probe) and re-plan the grid if the bins changed."""
+        rc = self.opts.receiver
+        if rc is None or self.simulated or not self._want_connected:
+            return
+        old_bin = self.grid.bin_hz
+        rc.resolve(port=self.settings.port)
+        self.source_factory = rc.source_factory(self.channels)
+        self.opts.span_planner = rc.span_planner()
+        self.settings.bin_hz = rc.bin_hz()
+        if abs(rc.bin_hz() - old_bin) > 1e-6:
+            self._replan(self.settings.start_mhz, self.settings.stop_mhz)
+        self._show_receiver()
+
+    def _select_receiver(self, name: str) -> None:
+        rc = self.opts.receiver
+        if rc is None:
+            return
+        rc.choice = name
+        if self._want_connected:
+            self._set_conn_state("connecting", f"{name}: probing...")
+            QtWidgets.QApplication.processEvents()
+            self._restart_reader(resolve=True)
+            self.status.setText(f"receiver {rc.label()}")
+        else:
+            self._show_receiver()
+
+    def _set_nolcd(self, on: bool) -> None:
+        rc = self.opts.receiver
+        if rc is None or rc.nolcd == on:
+            return
+        rc.nolcd = on
+        self.source_factory = rc.source_factory(self.channels)
+        if rc.backend == "fft" and self._want_connected:
+            self._restart_reader()
+        self._show_receiver()
+
+    # --------------------------------------------------------------- span --
+    def _replan(self, start: float, stop: float) -> None:
+        """New sweep span or bin width: new grid, everything on it restarts."""
         self.settings.start_mhz, self.settings.stop_mhz = start, stop
         self.grid, self.opts.hop_los_mhz = self.opts.span_planner(start, stop)
 
@@ -789,6 +861,19 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         self.p_spec.setXRange(self.grid.start_mhz, self.grid.stop_mhz, padding=0)
         self._build_hop_lines()
 
+    def _select_span(self, name: str) -> None:
+        """Sweep one channel (centre +- margin) or ALL (the starting span)."""
+        if name == self._span_name:
+            return
+        if name == "ALL":
+            start, stop = self._full_span
+        else:
+            ch = next(c for c in self.channels if c.name == name)
+            half = self.opts.channel_span_half_mhz
+            start, stop = ch.freq_mhz - half, ch.freq_mhz + half
+        self._span_name = name
+        self._stop_reader()
+        self._replan(start, stop)
         self._start_reader()
         self.status.setText(f"span {name}: {self.grid.start_mhz:.0f}-"
                             f"{self.grid.stop_mhz:.0f} MHz, "

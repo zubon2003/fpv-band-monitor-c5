@@ -67,8 +67,9 @@ class EspSettings:
     combine: str = "min"        # "min" (rejects artefacts) or "near"
     flip: bool = False          # mirror the spectrum (if carriers look swapped)
     require_c5: bool = True     # False for the 2.4 GHz mode (any ESP-SDR chip)
-    backend: str = "iq"         # "iq": hop + FFT here; "fw": finished sweeps from the LCD firmware
-    channels: tuple = ()        # (name, MHz) pairs, shown on the LCD in "fw" mode
+    backend: str = "iq"         # "iq": hop + FFT here; "fft" (or "fw"): finished sweeps from the LCD firmware
+    channels: tuple = ()        # (name, MHz) pairs, shown on the LCD in "fft" mode
+    nolcd: bool = False         # "fft": LCD off, the chip only sweeps
 
     @property
     def rate_hz(self) -> float:
@@ -495,7 +496,7 @@ def _receiver_process(es: EspSettings, s: SweepSettings,
     """Child-process body: run the hop loop, ship finished sweeps back."""
     factory = ((lambda: FakeEspSdr(sim_carriers, seed=1))
                if sim_carriers is not None else None)
-    if es.backend == "fw" and sim_carriers is None:
+    if es.backend in ("fft", "fw") and sim_carriers is None:
         from .fpv_link import fw_source
         src = fw_source(es)
     else:

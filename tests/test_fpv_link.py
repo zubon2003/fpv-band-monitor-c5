@@ -87,7 +87,7 @@ class TestFpvLink(unittest.TestCase):
         m, s, path = pty()
         dev = Fake(m, db)
         dev.start()
-        es = EspSettings(backend="fw", channels=(("E2", 5685), ("E1", 5705), ("F3", 5780), ("F5", 5820), ("F1", 5740)))
+        es = EspSettings(backend="fft", nolcd=True, channels=(("E2", 5685), ("E1", 5705), ("F3", 5780), ("F5", 5820), ("F1", 5740)))
         st = SweepSettings(start_mhz=5670.0, stop_mhz=5835.0, bin_hz=78125, gain=40, port=path)
         stop = threading.Event()
         lines = []
@@ -103,6 +103,8 @@ class TestFpvLink(unittest.TestCase):
         self.assertIn("FPV SPAN 5670.000 5835.000 E2,E1,F3,F5", dev.lines)   # 4 channels at most
         self.assertIn("FPV GAIN 40", dev.lines)
         self.assertIn("FPV STREAM ON", dev.lines)
+        on = dev.lines.index("FPV STREAM ON")
+        self.assertIn("FPV NOLCD", dev.lines[on:])                          # LCD off after STREAM ON
         self.assertEqual(lines[0].hz_low, 5670e6)
         self.assertEqual(lines[0].bin_width, 78125)
         np.testing.assert_allclose(lines[0].powers[3:], db[3:], atol=0.0051)
@@ -118,6 +120,82 @@ class TestFpvLink(unittest.TestCase):
         link.close()
         dev.halt.set()
         os.close(s)
+
+
+class TestReceiverChoice(unittest.TestCase):
+    def args(self, *argv):
+        from fpv_band_monitor.cli import build_parser
+        return build_parser().parse_args(["--channels", "E2,E1,F3,F5", *argv])
+
+    def test_auto_fft_iq(self):
+        from fpv_band_monitor.cli import ReceiverControl, _span_planner
+        a = self.args()
+        rc = ReceiverControl(a)
+        self.assertEqual(rc.choice, "auto")
+        self.assertEqual(rc.resolve(detect=lambda port: True), "fft")
+        self.assertEqual((a.bin_khz, a.step), (78.125, 25))
+        grid, _ = _span_planner(a)(5670.0, 5835.0)
+        self.assertEqual((grid.n, grid.bin_hz), (fpv_link.expected_bins(5670, 5835), 78125))
+        self.assertEqual(rc.resolve(detect=lambda port: False), "iq")     # no FPV? answer
+        self.assertEqual(a.bin_khz, 100.0)
+        rc.choice = "fft"
+        self.assertEqual(rc.resolve(detect=lambda port: False), "fft")    # forced
+        rc.choice = "iq"
+        self.assertEqual(rc.resolve(detect=lambda port: True), "iq")
+        self.assertEqual(ReceiverControl(self.args("--receiver", "fw")).choice, "fft")
+
+    def test_nolcd_reaches_settings(self):
+        from fpv_band_monitor.cli import ReceiverControl, _esp_settings
+        a = self.args("--nolcd")
+        rc = ReceiverControl(a)
+        rc.resolve(detect=lambda port: True)
+        es = _esp_settings(a)
+        self.assertEqual((es.backend, es.nolcd), ("fft", True))
+        rc.nolcd = False
+        self.assertFalse(_esp_settings(a).nolcd)
+        self.assertEqual(rc.label(), "fft")
+
+
+class TestGuiReceiverButtons(unittest.TestCase):
+    def test_switch_regrids(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from fpv_band_monitor import gui
+        except Exception as e:                      # Qt / pyqtgraph missing
+            self.skipTest(str(e))
+        from fpv_band_monitor import cli
+        rng = np.random.default_rng(2)
+        m, s, path = pty()
+        dev = Fake(m, rng.uniform(-90, -20, fpv_link.expected_bins(5670, 5835)).astype(np.float32))
+        dev.start()
+        a = cli.build_parser().parse_args(["--channels", "E2,E1,F3,F5", "--port", path])
+        rc = cli.ReceiverControl(a)
+        rc.resolve()                                 # auto: the fake answers FPV? -> fft
+        self.assertEqual(rc.backend, "fft")
+        channels, settings, grid, los = cli._grid_and_settings(a)
+        app = gui.QtWidgets.QApplication.instance() or gui.QtWidgets.QApplication([])
+        opts = gui.ViewOptions(span_planner=rc.span_planner(), receiver=rc, hop_los_mhz=los)
+        win = gui.BandMonitorWindow(channels, settings, grid, rc.source_factory(channels), opts)
+        try:
+            self.assertEqual(win.grid.bin_hz, 78125)
+            self.assertEqual(win.rx_label.text(), "-> fft")
+            self.assertTrue(win.chk_nolcd.isEnabled())
+            win.rx_buttons["iq"].click()             # iq: PC FFT, 100 kHz grid
+            self.assertEqual((rc.backend, win.grid.bin_hz), ("iq", 100000))
+            self.assertFalse(win.chk_nolcd.isEnabled())
+            win.rx_buttons["auto"].click()           # back to the firmware's sweeps
+            self.assertEqual((rc.backend, win.grid.bin_hz), ("fft", 78125))
+            self.assertEqual(win.wf.shape[1], win.grid.n)
+            win.chk_nolcd.setChecked(True)
+            t0 = time.monotonic()
+            while "FPV NOLCD" not in dev.lines and time.monotonic() - t0 < 5:
+                app.processEvents()
+                time.sleep(0.02)
+            self.assertIn("FPV NOLCD", dev.lines)
+        finally:
+            win.close()
+            dev.halt.set()
+            os.close(s)
 
 
 if __name__ == "__main__":

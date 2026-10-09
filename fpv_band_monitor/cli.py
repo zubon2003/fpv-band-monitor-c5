@@ -92,10 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ホップの LO 位置の点線を消す")
 
     g = p.add_argument_group("受信機 (上級)")
-    g.add_argument("--receiver", choices=("auto", "iq", "fw"), default="auto",
-                   help="auto: 液晶版ファームならスペクトラム受信 (fw)、ESP-SDR なら I/Q 受信 (iq)。"
-                        "fw はチップ上で FFT 済みの掃引を受け取る (USB 転送が少なく速い、"
-                        "ビン幅 78.125 kHz)。iq は従来どおり PC で FFT")
+    g.add_argument("--receiver", choices=("auto", "iq", "fft", "fw"), default="auto",
+                   help="auto (既定): 液晶版ファームなら FFT 済みの掃引 (fft) を受け取り、"
+                        "応答が無ければ ESP-SDR の I/Q (iq) で PC が FFT。"
+                        "fft は USB 転送が少なく速い (ビン幅 78.125 kHz)。"
+                        "fw は fft の旧名。GUI のボタンでも切り替えられる")
+    g.add_argument("--nolcd", action="store_true",
+                   help="fft 受信中は液晶の表示を止め、チップは掃引と FFT だけを全力で行う"
+                        " (受信をやめる・画面をタップすると表示が戻る)")
     g.add_argument("--margin-mhz", type=float, default=15.0,
                    help="掃引範囲を端のチャンネルの外へ広げる幅 MHz。Span ボタンの "
                         "1 チャンネル表示もこの ±幅 (既定 15)")
@@ -150,24 +154,87 @@ def _esp_settings(args) -> EspSettings:
                        bandwidth_mhz=args.bandwidth,
                        step_mhz=args.step, usable_mhz=args.usable,
                        dc_khz=args.dc_khz,
-                       backend=getattr(args, "backend", "iq"), channels=chans)
+                       backend=getattr(args, "backend", "iq"), channels=chans,
+                       nolcd=bool(getattr(args, "nolcd", False)))
 
 
-def _choose_receiver(args) -> None:
-    """Settle args.backend; fw sweeps come on the firmware's 78.125 kHz grid."""
-    args.backend = "iq"
-    if args.sim or args.receiver == "iq":
-        return
-    from .fpv_link import detect_firmware
-    if args.receiver == "fw" or detect_firmware(args.port):
-        args.backend = "fw"
-        # The firmware hops like this monitor (25 MHz steps, +-28 MHz kept) but
-        # FFTs 1024 points: build the display grid on the same bins.
-        args.bin_khz = 78.125
-        args.step = 25
-        print("受信: 液晶版ファームの掃引ストリーム (fw)")
-    elif args.receiver == "auto":
+RECEIVERS = ("auto", "iq", "fft")
+
+
+class ReceiverControl:
+    """Which receiver feeds the monitor: the LCD firmware's FFT'd sweeps
+    ("fft") or raw I/Q FFT'd here ("iq"); "auto" asks the device.
+
+    The two come on different grids (the firmware's 1024-point FFT gives
+    78.125 kHz bins, the I/Q path uses --bin-khz), so every change of the
+    resolved backend means a new display grid; the GUI re-plans with
+    span_planner() after resolve().
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.choice = "fft" if args.receiver == "fw" else args.receiver
+        self._iq_bin_khz = args.bin_khz
+        self._iq_step = args.step
+        args.backend = "iq"
+
+    def resolve(self, port=None, detect=None) -> str:
+        """Settle args.backend for the current choice; returns it."""
+        a = self.args
+        if port is not None:
+            a.port = port
+        backend = "iq"
+        if not a.sim and self.choice != "iq":
+            if self.choice == "fft":
+                backend = "fft"
+            else:
+                if detect is None:
+                    from .fpv_link import detect_firmware as detect
+                backend = "fft" if detect(a.port) else "iq"
+        a.backend = backend
+        if backend == "fft":
+            # The firmware hops like this monitor (25 MHz steps, +-28 MHz kept)
+            # but FFTs 1024 points: build the display grid on the same bins.
+            a.bin_khz, a.step = 78.125, 25
+        else:
+            a.bin_khz, a.step = self._iq_bin_khz, self._iq_step
+        return backend
+
+    @property
+    def backend(self) -> str:
+        return self.args.backend
+
+    @property
+    def nolcd(self) -> bool:
+        return bool(self.args.nolcd)
+
+    @nolcd.setter
+    def nolcd(self, on: bool) -> None:
+        self.args.nolcd = bool(on)
+
+    def bin_hz(self) -> int:
+        return int(round(self.args.bin_khz * 1000))
+
+    def span_planner(self):
+        return _span_planner(self.args)
+
+    def source_factory(self, channels):
+        return _source_factory(self.args, channels)
+
+    def label(self) -> str:
+        b = self.backend
+        return b + (" (LCD off)" if b == "fft" and self.nolcd else "")
+
+
+def _choose_receiver(args) -> ReceiverControl:
+    rc = ReceiverControl(args)
+    b = rc.resolve()
+    if b == "fft":
+        print("受信: 液晶版ファームの FFT 済み掃引 (fft)"
+              + (" / 液晶表示オフ" if args.nolcd else ""))
+    elif not args.sim:
         print("受信: ESP-SDR の I/Q (iq)")
+    return rc
 
 
 def _span(args, channels) -> tuple[float, float]:
@@ -269,11 +336,15 @@ def main(argv: list[str] | None = None) -> int:
         print(format_table())
         return 0
     if args.info:
+        rc = _choose_receiver(args)
         start, stop = _span(args, parse_channels(args.channels))
-        return esp_probe(_esp_settings(args), start, stop,
-                         int(round(args.bin_khz * 1000)))
+        if rc.backend == "fft":
+            from .fpv_link import probe as fw_probe
+            return fw_probe(args.port, start, stop, _esp_settings(args).channels,
+                            args.gain, nolcd=args.nolcd)
+        return esp_probe(_esp_settings(args), start, stop, rc.bin_hz())
 
-    _choose_receiver(args)
+    rc = _choose_receiver(args)
     channels, settings, grid, los = _grid_and_settings(args)
     source_factory = _source_factory(args, channels)
     args.search_mhz = auto_search_halfwidth(channels, args.search_mhz)
@@ -293,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                        show_hops=not args.no_hops,
                        hop_los_mhz=los,
                        span_planner=_span_planner(args),
+                       receiver=rc,
                        channel_span_half_mhz=args.margin_mhz,
                        dev_ok_mhz=args.dev_ok,
                        dev_warn_mhz=args.dev_warn,
