@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================
-#  FPV band monitor - ESP32-C5 (LCD band-monitor firmware), GUI (macOS)
+#  FPV band monitor - ESP32-C5 (ESP-SDR firmware), GUI (macOS)
 #  Uses the Python in .venv (made by install.command).
 #  Extra arguments are passed through when run from Terminal, e.g.
 #    ./band_monitor.command --channels R1,R4,F2,E1 --gain 55

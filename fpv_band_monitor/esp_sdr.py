@@ -1,10 +1,19 @@
-"""Hop plan, stitching and the simulated ESP32-C5 (no real-device I/Q here).
+"""ESP32-C5 as the receiver, via the ESP-SDR firmware (github.com/ESPARGOS/esp-sdr).
 
-The monitor now reads finished sweeps from the LCD firmware (fpv_link.py),
-which hops, FFTs and stitches on the chip exactly as below. This module keeps
-that reference: the hop plan and display grid (Stitcher), the Welch PSD and
-min-combine stitch, and FakeEspSdr for --sim, which produces synthetic I/Q
-and runs it through the same steps on the PC.
+ESP-SDR exposes the Wi-Fi modem's raw I/Q capture over the chip's native USB
+(Serial/JTAG) with newline-terminated ASCII commands:
+
+    FREQ <MHz>                 -> OK          (any whole MHz, 100-6000)
+    BANDWIDTH <MHz>            -> OK          (0 = widest analog filter)
+    GAIN MANUAL <idx> | GAIN HARDWARE -> OK
+    CAP16 <n> <rate>           -> DATA <n> <crc32> <us>\\n + n*2 bytes  (IQ8)
+    CAP20 <n> <rate>           -> DATA <n> <crc32> <us>\\n + ceil(n*2.5) (IQ10)
+    SYNC <nonce>               -> SYNC <nonce>
+
+Only the C5 has a 5 GHz front end. One capture is a snapshot of at most 16380
+samples (205 us at 80 MS/s) and the USB link is far slower than the modem, so
+this is not a streaming receiver: the band is covered by hopping the LO and
+taking one snapshot per hop, then stitching the per-hop spectra together.
 
 Stitching. Each hop's spectrum is trustworthy only near its centre, and every
 hop carries receiver artefacts at fixed offsets from its own LO - the DC spike
@@ -13,6 +22,9 @@ Hops are therefore spaced so that every grid bin is seen by two hops, and the
 default combine takes the *lower* of the two readings: a real carrier is at the
 same absolute frequency in both, an artefact only in one, so the minimum keeps
 the carrier and drops the ghost.
+
+The finished sweep is handed to SweepReader as one SpanLine, so everything
+downstream (averaging, centroid, GUI) works on one plain spectrum.
 """
 
 from __future__ import annotations
@@ -20,8 +32,10 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import queue
+import random
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -52,7 +66,9 @@ class EspSettings:
     dc_khz: float = 500.0       # half-width around each LO that is dropped
     combine: str = "min"        # "min" (rejects artefacts) or "near"
     flip: bool = False          # mirror the spectrum (if carriers look swapped)
-    channels: tuple = ()        # (name, MHz) pairs, sent to the LCD with the span
+    require_c5: bool = True     # False for the 2.4 GHz mode (any ESP-SDR chip)
+    backend: str = "iq"         # "iq": hop + FFT here; "fw": finished sweeps from the LCD firmware
+    channels: tuple = ()        # (name, MHz) pairs, shown on the LCD in "fw" mode
 
     @property
     def rate_hz(self) -> float:
@@ -134,6 +150,171 @@ def unpack_iq(raw: bytes, n: int, bits: int) -> np.ndarray:
     return (i - 1j * q).astype(np.complex64)
 
 
+class EspSdr:
+    """Minimal synchronous client for the ESP-SDR burst protocol."""
+
+    def __init__(self, port: str | None = None, timeout_s: float = 5.0,
+                 require_c5: bool = True):
+        try:
+            import serial
+        except ImportError:
+            raise EspSdrError("pyserial is required: pip install pyserial") \
+                from None
+        self.timeout_s = timeout_s
+        port = port or find_port()
+        if port is None:
+            raise EspSdrError(
+                "No ESP32 (USB VID 303A) found. Plug in the ESP32-C5 by its "
+                "USB (not UART) connector, or pass --esp-port COMx.\n"
+                "Serial ports seen:\n  " + "\n  ".join(list_port_lines()))
+        self.port = port
+        try:
+            # Native USB ignores the baud rate; 2 Mbaud matches a UART bridge.
+            # Open with RTS and DTR low: with pyserial's default (both high)
+            # the first command after every reopen was lost on a C3.
+            self.ser = serial.Serial(None, 2_000_000, timeout=timeout_s,
+                                     write_timeout=timeout_s)
+            self.ser.port = port
+            self.ser.dtr = False
+            self.ser.rts = False
+            self.ser.open()
+        except Exception as e:
+            raise EspSdrError(f"could not open {port}: {e}") from None
+        self._freq = None
+        self._gain = None
+        self.dropped = 0
+        self.synchronize()
+        self.identity = self.ask("INFO")
+        if not self.identity.split(" ", 1)[0].endswith("SDR"):
+            self.close()
+            raise EspSdrError(f"{port} answered '{self.identity}', "
+                              "not ESP-SDR firmware")
+        if require_c5 and not self.identity.startswith("C5SDR"):
+            self.close()
+            raise EspSdrError(
+                f"{port} answered '{self.identity}'. The 5.8 GHz band needs an "
+                "ESP32-C5 running ESP-SDR (other ESP32s are 2.4 GHz only).")
+        self.caps = self.ask("CAPS").split()[1:]
+        self.range = None
+        if "TUNEEXT" in self.caps:
+            r = self.ask("RANGE?").split()
+            self.range = (int(r[1]), int(r[2]))
+        self.gain_max = None
+        if "RXLIMITS" in self.caps:
+            import json
+            lim = json.loads(self.ask("LIMITS?")[len("LIMITS "):])
+            self.gain_max = int(lim["gain"][1])
+
+    # -- low level ----------------------------------------------------------
+    def _send(self, text: str) -> None:
+        self.ser.write((text + "\n").encode("ascii"))
+
+    def _line(self) -> str:
+        raw = self.ser.readline()
+        if not raw.endswith(b"\n"):
+            raise EspSdrError("ESP32 did not answer (timeout)")
+        return raw.decode("ascii", "replace").strip()
+
+    def ask(self, text: str) -> str:
+        self._send(text)
+        reply = self._line()
+        if reply.startswith("ERR"):
+            raise EspSdrError(f"{text!r} -> {reply}")
+        return reply
+
+    def synchronize(self) -> None:
+        """Drain boot logs / half-read payloads until our nonce echoes back.
+
+        Short attempts, several of them: a healthy link answers in ~1 ms, so
+        a lost command should cost 0.5 s, not the whole budget. The read
+        timeout has to be short too, or one empty read overshoots the
+        deadline by the full 5 s port timeout (that was the 5.2 s reconnect).
+        """
+        self.ser.timeout = 0.05
+        try:
+            for _ in range(8):
+                nonce = str(random.randrange(10**12))
+                self.ser.reset_input_buffer()
+                self._send("\nSYNC " + nonce)
+                deadline = time.monotonic() + 0.5
+                buf = b""
+                while time.monotonic() < deadline:
+                    chunk = self.ser.read(max(1, self.ser.in_waiting))
+                    buf = (buf + chunk)[-64:]
+                    if f"SYNC {nonce}\n".encode() in buf:
+                        return
+        finally:
+            self.ser.timeout = self.timeout_s
+        raise EspSdrError(
+            f"{self.port}: no ESP-SDR answer. Is the ESP-SDR firmware flashed, "
+            "and is the browser ESP-WebSDR (or another program) closed?")
+
+    # -- controls -----------------------------------------------------------
+    def set_freq(self, mhz: int) -> None:
+        if mhz != self._freq:
+            self._freq = None
+            self.ask(f"FREQ {int(mhz)}")
+            self._freq = mhz
+
+    def set_bandwidth(self, mhz: int) -> None:
+        self.ask(f"BANDWIDTH {int(mhz)}")
+
+    def set_gain(self, index: int) -> None:
+        if index is None or index < 0:
+            cmd = "GAIN HARDWARE"
+        else:
+            if self.gain_max is not None:
+                index = min(int(index), self.gain_max)
+            cmd = f"GAIN MANUAL {int(index)}"
+        if cmd != self._gain:
+            self.ask(cmd)
+            self._gain = cmd
+
+    def capture(self, n: int, rate_index: int = 0, bits: int = 10) -> np.ndarray:
+        n = max(256, min(int(n), MAX_SAMPLES))
+        nbytes = n * 2 if bits == 8 else (n * 20 + 7) // 8
+        for attempt in range(4):
+            self._send(f"CAP{16 if bits == 8 else 20} {n} {rate_index}")
+            try:
+                head = self._line()
+                if head.startswith("ERR"):
+                    raise EspSdrError(head)
+                parts = head.split()
+                if len(parts) != 4 or parts[0] != "DATA" or int(parts[1]) != n:
+                    raise EspSdrError(f"bad capture header: {head!r}")
+                # A healthy payload streams at ~700 kB/s. When one goes
+                # missing it never arrives, so do not sit on the 5 s default.
+                self.ser.timeout = 0.3 + nbytes / 100e3
+                try:
+                    raw = self.ser.read(nbytes)
+                finally:
+                    self.ser.timeout = self.timeout_s
+                if len(raw) != nbytes:
+                    raise EspSdrError("capture payload truncated")
+                if zlib.crc32(raw) != int(parts[2], 16):
+                    raise EspSdrError("capture CRC mismatch")
+                return unpack_iq(raw, n, bits)
+            except EspSdrError:
+                self.dropped += 1
+                if attempt == 3:
+                    raise
+                self.synchronize()
+        raise AssertionError("unreachable")
+
+    def close(self) -> None:
+        try:
+            self._send("RELEASE")
+        except Exception:
+            pass
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Simulated ESP32-C5 (same interface), for --sim and tests
+# --------------------------------------------------------------------------- #
 class FakeEspSdr:
     """Synthesises what a C5 would capture: FM-video carriers, thermal noise,
     a DC offset, an I/Q-imbalance image, the analog filter roll-off and 10-bit
@@ -273,12 +454,14 @@ class Stitcher:
 def esp_source(es: EspSettings, device_factory=None):
     """Build a SweepReader source that hops an ESP32-C5 over the span.
 
-    device_factory() returns a connected FakeEspSdr (the simulator). The
+    device_factory() returns a connected EspSdr (or FakeEspSdr); the default
+    opens the real device on s.port (None = first Espressif USB device). The
     first item yielded is a DeviceInfo naming the port that was opened.
     """
 
     def source(s: SweepSettings, stop: threading.Event) -> Iterator[SpanLine]:
-        dev = device_factory()
+        dev = (device_factory
+               or (lambda: EspSdr(s.port, require_c5=es.require_c5)))()
         try:
             yield DeviceInfo(dev.port, dev.identity)
             st = Stitcher(s.start_mhz, s.stop_mhz, es, s.bin_hz)
@@ -312,10 +495,10 @@ def _receiver_process(es: EspSettings, s: SweepSettings,
     """Child-process body: run the hop loop, ship finished sweeps back."""
     factory = ((lambda: FakeEspSdr(sim_carriers, seed=1))
                if sim_carriers is not None else None)
-    if sim_carriers is None:                 # the device: finished sweeps
+    if es.backend == "fw" and sim_carriers is None:
         from .fpv_link import fw_source
         src = fw_source(es)
-    else:                                    # --sim: synthetic I/Q, stitched here
+    else:
         src = esp_source(es, factory)
     try:
         for line in src(s, stop):
@@ -376,3 +559,68 @@ def process_source(es: EspSettings, sim_carriers: list | None = None):
                 proc.join(timeout=1.0)
 
     return source
+
+
+def probe(es: EspSettings, start_mhz: float, stop_mhz: float,
+          bin_hz: float = 100_000) -> int:
+    """--info for the ESP backend: identity, timing and per-hop shape."""
+    print("serial ports:")
+    for line in list_port_lines():
+        print("  " + line)
+    try:
+        dev = EspSdr(es.port, require_c5=es.require_c5)
+    except EspSdrError as e:
+        print(f"\nerror: {e}")
+        return 1
+    try:
+        print(f"\nport     : {dev.port}")
+        print(f"identity : {dev.identity}")
+        print(f"caps     : {' '.join(dev.caps)}")
+        print(f"range    : {dev.range}   gain max: {dev.gain_max}")
+        st = Stitcher(start_mhz, stop_mhz, es, bin_hz)
+        print(f"hops     : {len(st.los)} x {es.samples} samples @ "
+              f"{es.rate_hz/1e6:.0f} MS/s, IQ{es.bits}, LO "
+              f"{st.los[0]}..{st.los[-1]} step {es.step_mhz} MHz")
+        dev.set_bandwidth(es.bandwidth_mhz)
+        mid = st.los[len(st.los) // 2]
+        dev.set_freq(mid)
+        print(f"\nADC level at {mid} MHz by gain index (want peak < 0.9):")
+        top = dev.gain_max or 80
+        for g in sorted({0, top // 4, top // 2, 40, 3 * top // 4, top}):
+            dev.set_gain(g)
+            iq = dev.capture(es.samples, es.rate_index, es.bits)
+            peak = float(max(np.abs(iq.real).max(), np.abs(iq.imag).max()))
+            rms = float(np.sqrt(np.mean(np.abs(iq - iq.mean()) ** 2)))
+            print(f"  gain {g:3d}: rms {rms:.4f}  peak {peak:.3f}"
+                  + ("  CLIPPING" if peak >= 0.99 else ""))
+        dev.set_gain(es.gain)
+
+        t0 = time.monotonic()
+        for lo in st.los:
+            dev.set_freq(lo)
+        t_tune = (time.monotonic() - t0) / len(st.los)
+        t0 = time.monotonic()
+        spectra = []
+        for _ in range(3):
+            iq = dev.capture(es.samples, es.rate_index, es.bits)
+            spectra.append(hop_spectrum_db(iq, st.nfft))
+        t_cap = (time.monotonic() - t0) / 3
+        per_sweep = len(st.los) * (t_tune + t_cap)
+        print(f"\nretune {t_tune*1e3:.1f} ms, capture+transfer "
+              f"{t_cap*1e3:.1f} ms per hop -> about {1/per_sweep:.2f} sweeps/s")
+
+        # Noise shape across one hop: tells how wide --esp-usable can be.
+        db = np.mean(spectra, axis=0)
+        rel = (np.arange(st.nfft) - st.nfft // 2) * st.bin_hz / HZ
+        print("\nnoise profile of one hop (median dB vs offset from LO):")
+        ref = float(np.median(db[np.abs(rel) < 4]))
+        for lo_edge in range(-30, 30, 4):
+            m = (rel >= lo_edge) & (rel < lo_edge + 4)
+            if m.any():
+                v = float(np.median(db[m])) - ref
+                print(f"  {lo_edge:+3d}..{lo_edge+4:+3d} MHz: {v:+6.1f} dB "
+                      + "#" * max(0, int(40 + v * 2)))
+        print(f"\ndropped captures: {dev.dropped}")
+    finally:
+        dev.close()
+    return 0

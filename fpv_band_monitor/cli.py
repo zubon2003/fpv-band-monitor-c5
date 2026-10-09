@@ -12,7 +12,7 @@ from .analysis import (Smoother, SpectrumAverager, auto_search_halfwidth,
                        format_status, measure_all)
 from .channels import DEFAULT_CHANNELS, format_table, parse_channels
 from .esp_sdr import EspSettings, Stitcher, process_source
-from .fpv_link import probe as fw_probe
+from .esp_sdr import probe as esp_probe
 from .sweep import DeviceInfo, FrequencyGrid, SweepReader, SweepSettings
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "band_monitor.toml"
@@ -21,9 +21,8 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "band_monitor.toml"
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="band_monitor",
-        description="XIAO ESP32-C5 (液晶版バンドモニタのファーム) から掃引を受け取り、"
-                    "FPV 5.8GHz の映像チャンネルを監視する。スペクトラム・"
-                    "ウォーターフォール・実測中心周波数。",
+        description="ESP32-C5 (ESP-SDR ファーム) で FPV 5.8GHz の映像チャンネルを"
+                    "監視する。スペクトラム・ウォーターフォール・実測中心周波数。",
         epilog="設定ファイル: 既定で band_monitor.toml (band_monitor.py と同じ"
                "フォルダ) を読む。キーはオプション名 (例 port = \"COM14\")。"
                "コマンドラインの指定が設定ファイルより優先。",
@@ -40,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "MHz の数字や 名前@MHz も可。一覧は --list-channels")
     g.add_argument("--port", help="COM ポート (省略時は Espressif の USB を自動検出)")
     g.add_argument("--gain", type=int, default=40,
-                   help="ゲイン (内部テーブル番号 0-60、dB ではない。-1=AGC。既定 40)。"
+                   help="ゲイン (内部テーブル番号、dB ではない。既定 40)。"
                         "近くの VTX で山が横に広がるときは下げる (C5 実測: 55 以上で飽和)")
     g.add_argument("--config", metavar="PATH",
                    help="設定ファイル (既定 band_monitor.toml、無ければ使わない)")
@@ -51,7 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--headless", action="store_true",
                    help="画面なし。コンソールに実測中心を表示")
     g.add_argument("--info", action="store_true",
-                   help="接続確認 (ファームの応答・状態・5 秒間の掃引速度とフロア) をして終了")
+                   help="ESP32 の診断 (ファーム応答・ゲイン別 ADC レベル・ホップ速度・"
+                        "ホップ内ノイズ形状) をして終了")
     g.add_argument("--list-channels", action="store_true",
                    help="5.8GHz のチャンネル表を表示して終了")
     g.add_argument("--csv", metavar="PATH", help="実測中心を CSV に記録")
@@ -92,9 +92,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ホップの LO 位置の点線を消す")
 
     g = p.add_argument_group("受信機 (上級)")
+    g.add_argument("--receiver", choices=("auto", "iq", "fw"), default="auto",
+                   help="auto: 液晶版ファームならスペクトラム受信 (fw)、ESP-SDR なら I/Q 受信 (iq)。"
+                        "fw はチップ上で FFT 済みの掃引を受け取る (USB 転送が少なく速い、"
+                        "ビン幅 78.125 kHz)。iq は従来どおり PC で FFT")
     g.add_argument("--margin-mhz", type=float, default=15.0,
                    help="掃引範囲を端のチャンネルの外へ広げる幅 MHz。Span ボタンの "
                         "1 チャンネル表示もこの ±幅 (既定 15)")
+    g.add_argument("--samples", type=int, default=8192,
+                   help="1 ホップの取り込みサンプル数 (256-16380、既定 8192)。"
+                        "増やすと平均が効くが遅くなる")
+    g.add_argument("--step", type=int, default=25,
+                   help="ホップ間隔 MHz (既定 25)。--usable 以下にする "
+                        "(どの周波数も 2 ホップで見るため)")
+    g.add_argument("--usable", type=float, default=28.0,
+                   help="1 ホップで使う LO からの片側幅 MHz (既定 28。"
+                        "C5 実測でホップ内 ±30MHz が ±1dB 以内)")
+    g.add_argument("--dc-khz", type=float, default=500.0,
+                   help="LO の DC スパイクの周りで捨てる片側幅 kHz (既定 500)")
+    g.add_argument("--bandwidth", type=int, default=0,
+                   help="受信フィルタ MHz (11-48、既定 0=最大)")
+    g.add_argument("--bin-khz", type=float, default=100.0,
+                   help="スペクトラムのビン幅 kHz (既定 100)")
     return p
 
 
@@ -124,20 +143,31 @@ def load_config(path: Path, parser: argparse.ArgumentParser) -> dict:
     return out
 
 
-# The firmware's sweep (main/fpv/fpv_config.h): 25 MHz hops, +-28 MHz kept,
-# +-500 kHz around each LO dropped, 8192 samples, 1024-point FFT at 80 MS/s.
-FW_STEP_MHZ = 25
-FW_USABLE_MHZ = 28.0
-FW_DC_KHZ = 500.0
-FW_SAMPLES = 8192
-FW_BIN_HZ = 78125
-
-
 def _esp_settings(args) -> EspSettings:
+    # 80 MS/s, IQ10, min-combine, no flip: the settings checked on the C5.
     chans = tuple((c.name, c.freq_mhz) for c in parse_channels(args.channels))
-    return EspSettings(port=args.port, gain=args.gain, samples=FW_SAMPLES,
-                       step_mhz=FW_STEP_MHZ, usable_mhz=FW_USABLE_MHZ,
-                       dc_khz=FW_DC_KHZ, channels=chans)
+    return EspSettings(port=args.port, gain=args.gain, samples=args.samples,
+                       bandwidth_mhz=args.bandwidth,
+                       step_mhz=args.step, usable_mhz=args.usable,
+                       dc_khz=args.dc_khz,
+                       backend=getattr(args, "backend", "iq"), channels=chans)
+
+
+def _choose_receiver(args) -> None:
+    """Settle args.backend; fw sweeps come on the firmware's 78.125 kHz grid."""
+    args.backend = "iq"
+    if args.sim or args.receiver == "iq":
+        return
+    from .fpv_link import detect_firmware
+    if args.receiver == "fw" or detect_firmware(args.port):
+        args.backend = "fw"
+        # The firmware hops like this monitor (25 MHz steps, +-28 MHz kept) but
+        # FFTs 1024 points: build the display grid on the same bins.
+        args.bin_khz = 78.125
+        args.step = 25
+        print("受信: 液晶版ファームの掃引ストリーム (fw)")
+    elif args.receiver == "auto":
+        print("受信: ESP-SDR の I/Q (iq)")
 
 
 def _span(args, channels) -> tuple[float, float]:
@@ -152,7 +182,7 @@ def _span_planner(args):
     again when the span buttons narrow the sweep to one channel.
     """
     es = _esp_settings(args)
-    bin_hz = FW_BIN_HZ
+    bin_hz = int(round(args.bin_khz * 1000))
 
     def plan(start: float, stop: float):
         st = Stitcher(start, stop, es, bin_hz)
@@ -167,7 +197,8 @@ def _span_planner(args):
 def _grid_and_settings(args):
     channels = parse_channels(args.channels)
     start, stop = _span(args, channels)
-    settings = SweepSettings(start_mhz=start, stop_mhz=stop, bin_hz=FW_BIN_HZ,
+    bin_hz = int(round(args.bin_khz * 1000))
+    settings = SweepSettings(start_mhz=start, stop_mhz=stop, bin_hz=bin_hz,
                              gain=args.gain, port=args.port)
     grid, los = _span_planner(args)(start, stop)
     return channels, settings, grid, los
@@ -239,8 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.info:
         start, stop = _span(args, parse_channels(args.channels))
-        return fw_probe(args.port, start, stop, _esp_settings(args).channels, args.gain)
+        return esp_probe(_esp_settings(args), start, stop,
+                         int(round(args.bin_khz * 1000)))
 
+    _choose_receiver(args)
     channels, settings, grid, los = _grid_and_settings(args)
     source_factory = _source_factory(args, channels)
     args.search_mhz = auto_search_halfwidth(channels, args.search_mhz)
