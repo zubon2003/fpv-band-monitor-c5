@@ -10,7 +10,9 @@ cd /d "%~dp0"
 set "VPY=%~dp0.venv\Scripts\python.exe"
 if not exist "%VPY%" goto :not_installed
 
-"%VPY%" band_monitor.py %*
+rem --nolcd: with the LCD firmware (fft), its LCD is turned off while the PC
+rem receives, for faster sweeps (ignored with iq; the No LCD box turns it back)
+"%VPY%" band_monitor.py --nolcd %*
 if errorlevel 1 goto :failed
 endlocal
 exit /b 0

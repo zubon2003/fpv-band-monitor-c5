@@ -14,7 +14,9 @@ if [ ! -x .venv/bin/python ]; then
     exit 1
 fi
 
-.venv/bin/python band_monitor.py "$@"
+# --nolcd: with the LCD firmware (fft), its LCD is turned off while the PC
+# receives, for faster sweeps (ignored with iq; the No LCD box turns it back)
+.venv/bin/python band_monitor.py --nolcd "$@"
 status=$?
 if [ $status -ne 0 ]; then
     echo
