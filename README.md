@@ -1,18 +1,28 @@
 # fpv-band-monitor-c5
 
-**ESP32-C5** で FPV 5.8GHz の 4 波（既定は **E2 / E1 / F3 / F5**）を監視するバンドモニタ。
+**ESP32-C5** で FPV 5.8GHz の映像チャンネル（既定は **E2 / E1 / F3 / F5**）を監視する PC 用バンドモニタ。
 **アナログ FPV の映像電波（FM-ATV）専用**。
 HackRF One 版の fpv-band-monitor から C5 専用に切り出したもの。
 解析（重心による中心周波数、SNR による在り判定）と GUI は同じ。
 
 - スペクトラム + ウォーターフォール、9MHz / 17MHz の帯域幅マーク
-- 各チャンネルの **実測中心周波数** をリアルタイム表示
+- 各チャンネルの **実測中心周波数** と **ずれ** をリアルタイム表示（ずれの大きさで色分け）
+- **グループ**（4CH / 4CH2 / 4CH3 / 3CH）の切り替え、カードのクリックで 1 チャンネルだけを掃引
+- **WiFi check**：グループに影響する Wi-Fi（チャンネルに重なる Direct と、VTX との IMD）を受信だけで調べる
+- 液晶版ファーム（XIAO ESP32-C5 + 液晶）とつながり、チップで FFT 済みの掃引を受け取れる（下記）
+
+液晶版ファームはこのモニタを XIAO ESP32-C5 単体で動かしたもので、液晶だけでも同じ監視ができる：
+**[ファーム書き込みページ](https://zubon2003.github.io/fpv-lcd/)**（ブラウザから書き込み）・
+ソース [zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)
 
 ## 必要なもの
 
-- **ESP32-C5** の基板（例: ESP32-C5-DevKitC-1）。5GHz 帯を受けられる ESP32 は C5 だけ
+- **ESP32-C5** の基板（例: ESP32-C5-DevKitC-1、XIAO ESP32-C5）。5GHz 帯を受けられる ESP32 は C5 だけ
   （C3/C6/S3 などは 2.4GHz のみ）
-- [ESP-SDR](https://github.com/ESPARGOS/esp-sdr) ファームウェア
+- ファームウェアはどちらか
+  - [ESP-SDR](https://github.com/ESPARGOS/esp-sdr)：I/Q を PC で FFT する（`iq`）。どの C5 基板でも使える
+  - **液晶版ファーム**（[fpv-lcd](https://github.com/zubon2003/fpv-lcd)、XIAO ESP32-C5 + 3.5" 液晶）：
+    FFT 済みの掃引（`fft`）・SAT 表示・WiFi check はこちらだけ。`iq` でも使える
 - Python 3.11 以上（3.13 推奨）。Windows は [python.org](https://www.python.org/downloads/)、
   Mac は python.org のインストーラーか `brew install python@3.13`
   （Mac 標準の `/usr/bin/python3` は 3.9 のことが多く使えない）
@@ -30,7 +40,12 @@ HackRF One 版の fpv-band-monitor から C5 専用に切り出したもの。
 
 ### ファームウェアの書き込み
 
-ブラウザ（Chrome / Edge）の [firmware installer](https://espargos.net/espsdr/app/flash.html) で
+**液晶版ファーム**：ブラウザ（Chrome / Edge）で [ファーム書き込みページ](https://zubon2003.github.io/fpv-lcd/) を開き、
+液晶（3.5" Pico-ResTouch-LCD-3.5 か 3.5" Capacitive Touch LCD）を選んで書き込む。
+結線図：[ResTouch](https://zubon2003.github.io/fpv-lcd/wiring/restouch35.html) ・
+[静電容量式](https://zubon2003.github.io/fpv-lcd/wiring/captouch35.html)
+
+**ESP-SDR**：ブラウザ（Chrome / Edge）の [firmware installer](https://espargos.net/espsdr/app/flash.html) で
 ESP32-C5 を選ぶのが簡単。esptool を使う場合は
 [esp-web-sdr](https://github.com/ESPARGOS/esp-web-sdr) の `firmware/` で:
 
@@ -57,10 +72,25 @@ C5 の **ネイティブ USB 側の端子**を PC に挿す（VID 303A のポー
 コマンドで直接動かすときも `.venv` の Python を使う:
 
 ```powershell
-.venv\Scripts\python band_monitor.py --channels F3       # Windows
+.venv\Scripts\python band_monitor.py --channels E1,A8,A5,F5   # Windows（4CH2 グループで起動）
 .venv/bin/python band_monitor.py --port /dev/cu.usbmodem1101   # Mac（ポート名の例）
 .venv\Scripts\python band_monitor.py --help             # オプション一覧（区分別）
 ```
+
+### 画面の操作
+
+| 場所 | 動作 |
+|---|---|
+| Port / Connect | ポートの選択（開くたびに一覧を読み直す、`[ESP32]` が C5）と接続・切断 |
+| Rx: auto / iq / fft・No LCD | 受信方式（下記「液晶版ファームとの接続」） |
+| **Group** 4CH / 4CH2 / 4CH3 / 3CH | 監視するチャンネルの組を切り替える（下記） |
+| **WiFi check** | 今のグループに影響する Wi-Fi を調べる（下記） |
+| Span（チャンネル名 / ALL） | そのチャンネルの前後 ±15 MHz だけを掃引（ホップが減って速い）/ グループ全体 |
+| 下段のカード | クリックでそのチャンネルだけを掃引、もう一度で ALL |
+| Gain idx・Apply gain | ゲイン（テーブル番号、AGC も可）。近くの VTX で山が横に広がる・**SAT** が出るなら下げる |
+| Pause・Peak hold・Clear | 表示の一時停止、ピークホールド、平均とウォーターフォールのクリア |
+| detect SNR | 信号ありと判定する、ノイズからの高さ |
+| Y / WF | スペクトラムの縦軸、ウォーターフォールの色の範囲（Auto で自動） |
 
 ## インストーラーの動作確認（2026-10-03）
 
@@ -72,6 +102,7 @@ C5 の **ネイティブ USB 側の端子**を PC に挿す（VID 303A のポー
   colorama 0.4.6、pyserial 3.5）がすべて入る
 - `band_monitor.bat` から `.venv` の Python で起動し、疑似 C5 で受信用の子プロセスも含めて正常に動く
 - 液晶版ファームを書いた XIAO ESP32-C5 の実機で `fft` / `iq` / No LCD を確認（2026-10-09）
+- 同じく実機で、グループの切り替え（12 回、毎回 1〜1.5 秒で受信再開）と WiFi check（4CH で 18 ch・22 秒）を確認（2026-10-14）
 
 **Mac（確認済み、2026-10-10）**
 
@@ -107,7 +138,7 @@ Span ボタンで 1 チャンネル表示にすると液晶も同じスパンに
 
 コマンドとフレームの形式は液晶版ファームの `main/fpv/link.h` にある。
 
-## グループ・カード・WiFi チェック（液晶版と同じ機能）
+## グループ・カード・WiFi check（液晶版と同じ機能）
 
 - **Group**（4CH / 4CH2 / 4CH3 / 3CH）：液晶版と同じチャンネルの組。押すとチャンネル・カード・Span ボタン・掃引範囲が切り替わる。
   `--channels` がどのグループとも違うときは、どれも押されていない状態（custom）で始まる
