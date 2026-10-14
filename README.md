@@ -9,20 +9,18 @@ HackRF One 版の fpv-band-monitor から C5 専用に切り出したもの。
 - 各チャンネルの **実測中心周波数** と **ずれ** をリアルタイム表示（ずれの大きさで色分け）
 - **グループ**（4CH / 4CH2 / 4CH3 / 3CH）の切り替え、カードのクリックで 1 チャンネルだけを掃引
 - **WiFi check**：グループに影響する Wi-Fi（チャンネルに重なる Direct と、VTX との IMD）を受信だけで調べる
-- 液晶版ファーム（XIAO ESP32-C5 + 液晶）とつながり、チップで FFT 済みの掃引を受け取れる（下記）
+- チップで FFT 済みの掃引を受け取る（USB の転送が少なく速い）
 
-液晶版ファームはこのモニタを XIAO ESP32-C5 単体で動かしたもので、液晶だけでも同じ監視ができる：
-**[ファーム書き込みページ](https://zubon2003.github.io/fpv-lcd/)**（ブラウザから書き込み）・
-ソース [zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)
+**対応ファームウェアは液晶版ファームのみ**：
+**[zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)**（GPL-3.0、[ESPARGOS/esp-sdr](https://github.com/ESPARGOS/esp-sdr) のフォーク）。
+このモニタを XIAO ESP32-C5 単体で動かしたもので、液晶だけでも同じ監視ができる。
+[ファーム書き込みページ](https://zubon2003.github.io/fpv-lcd/) からブラウザで書き込める。
 
 ## 必要なもの
 
-- **ESP32-C5** の基板（例: ESP32-C5-DevKitC-1、XIAO ESP32-C5）。5GHz 帯を受けられる ESP32 は C5 だけ
-  （C3/C6/S3 などは 2.4GHz のみ）
-- ファームウェアはどちらか
-  - [ESP-SDR](https://github.com/ESPARGOS/esp-sdr)：I/Q を PC で FFT する（`iq`）。どの C5 基板でも使える
-  - **液晶版ファーム**（[fpv-lcd](https://github.com/zubon2003/fpv-lcd)、XIAO ESP32-C5 + 3.5" 液晶）：
-    FFT 済みの掃引（`fft`）・SAT 表示・WiFi check はこちらだけ。`iq` でも使える
+- **XIAO ESP32-C5**（5GHz 帯を受けられる ESP32 は C5 だけ。C3/C6/S3 などは 2.4GHz のみ）
+- **液晶版ファーム**（[zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)、GPL-3.0）と 3.5" 液晶
+  （Waveshare Pico-ResTouch-LCD-3.5 か 3.5inch Capacitive Touch LCD）
 - Python 3.11 以上（3.13 推奨）。Windows は [python.org](https://www.python.org/downloads/)、
   Mac は python.org のインストーラーか `brew install python@3.13`
   （Mac 標準の `/usr/bin/python3` は 3.9 のことが多く使えない）
@@ -40,20 +38,12 @@ HackRF One 版の fpv-band-monitor から C5 専用に切り出したもの。
 
 ### ファームウェアの書き込み
 
-**液晶版ファーム**：ブラウザ（Chrome / Edge）で [ファーム書き込みページ](https://zubon2003.github.io/fpv-lcd/) を開き、
+ブラウザ（Chrome / Edge）で [ファーム書き込みページ](https://zubon2003.github.io/fpv-lcd/) を開き、
 液晶（3.5" Pico-ResTouch-LCD-3.5 か 3.5" Capacitive Touch LCD）を選んで書き込む。
 結線図：[ResTouch](https://zubon2003.github.io/fpv-lcd/wiring/restouch35.html) ・
-[静電容量式](https://zubon2003.github.io/fpv-lcd/wiring/captouch35.html)
-
-**ESP-SDR**：ブラウザ（Chrome / Edge）の [firmware installer](https://espargos.net/espsdr/app/flash.html) で
-ESP32-C5 を選ぶのが簡単。esptool を使う場合は
-[esp-web-sdr](https://github.com/ESPARGOS/esp-web-sdr) の `firmware/` で:
-
-```powershell
-python -m esptool --chip esp32c5 --port COMx write-flash @esp32c5/flash_args
-```
-
-（ESP-SDR にはライセンス表記が無いので、バイナリはこのリポジトリに同梱していない）
+[静電容量式](https://zubon2003.github.io/fpv-lcd/wiring/captouch35.html)。
+ソースとビルド方法は [zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)（GPL-3.0）。
+ファームのバイナリはこのリポジトリには入れていない。
 
 ## 使い方
 
@@ -114,15 +104,15 @@ C5 の **ネイティブ USB 側の端子**を PC に挿す（VID 303A のポー
 
 ## 液晶版ファームとの接続（掃引ストリーム）
 
-XIAO ESP32-C5 の液晶版ファーム（ESP-SDR に液晶モニタを組み込んだもの）は、チップ上で FFT とつなぎ合わせを済ませた
+液晶版ファーム（ESP-SDR に液晶モニタを組み込んだもの）は、チップ上で FFT とつなぎ合わせを済ませた
 **掃引を 1 回ごとに USB で送れる**。I/Q を送る従来方式（1 ホップ約 20 KB）に比べ、4CH の掃引 1 回が約 4 KB で済むので、
 USB の転送待ちが無くなる。液晶側でも同じ掃引を表示し続ける。
 
 | 受信方式（`--receiver` / 画面の Rx ボタン） | 動作 |
 |---|---|
-| `auto`（既定） | 接続するたびに `FPV?` を送り、液晶版ファームが答えれば `fft`、答えなければ（通常の ESP-SDR）`iq` |
+| `auto`（既定） | 接続するたびに `FPV?` を送り、答えれば `fft`、答えなければ `iq` |
 | `fft` | チップで FFT 済みの掃引を受け取る。ビン幅はファームと同じ 78.125 kHz。平均・重心・判定は従来どおり PC で行う（旧名 `fw` も可） |
-| `iq` | 従来どおり I/Q を受け取って PC で FFT（液晶版ファームでもこちらは使える。その間、液晶の掃引は止まる） |
+| `iq` | I/Q を受け取って PC で FFT（その間、液晶の掃引は止まる。SAT 表示・WiFi check は使えない） |
 
 画面上部の **Rx: auto / iq / fft** ボタンで実行中に切り替えられる。auto のときは右に実際の方式（`-> fft` / `-> iq`）が出る。
 方式が変わるとビン幅が変わるので、スペクトラムとウォーターフォールは新しい格子で描き直しになる。
@@ -157,8 +147,10 @@ Span ボタンで 1 チャンネル表示にすると液晶も同じスパンに
   **IMD**＝2×VTX−WiFi・2×WiFi−VTX が乗るもの。4CH なら 18 ch）を 1.2 秒ずつ**受信だけで**聞く（液晶版ファームの `FPV WIFI`。
   電波は出さない）。その間 PC の受信は止まる（約 15〜22 秒）。結果は FPV チャンネルごとに OK / Direct / IMD と、原因の
   Wi-Fi ch・dBm・IMD の組み合わせ・AP 名。Wi-Fi が弱いほど色が薄い（-50 dBm で最も濃く、-85 dBm 以下で薄い）。
-  液晶版ファームが必要（通常の ESP-SDR では答えないのでエラーになる）
+  液晶版ファームの `FPV WIFI` を使う
 
 ## ライセンス
 
-MIT License（[LICENSE](LICENSE)）。ESP-SDR ファームウェアは別プロジェクト（同梱していない）。
+このモニタ（PC 版）は MIT License（[LICENSE](LICENSE)）。
+液晶版ファームは別リポジトリ [zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)（GPL-3.0、ESP-SDR のフォーク）で、
+ここには同梱していない（USB でつながるだけ）。
