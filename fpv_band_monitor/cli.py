@@ -347,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     rc = _choose_receiver(args)
     channels, settings, grid, los = _grid_and_settings(args)
     source_factory = _source_factory(args, channels)
+    search_request = args.search_mhz
     args.search_mhz = auto_search_halfwidth(channels, args.search_mhz)
 
     if args.headless:
@@ -355,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     from .gui import ViewOptions, run_gui  # imported late: Qt is optional
     marks = tuple(float(x) for x in args.bw_marks.split(",") if x.strip())
     opts = ViewOptions(bw_marks_mhz=marks, search_mhz=args.search_mhz,
+                       search_request_mhz=search_request,
                        min_snr_db=args.min_snr,
                        noise_margin_db=args.centroid_margin,
                        centroid_half_mhz=args.centroid_half,

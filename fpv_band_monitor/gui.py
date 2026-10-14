@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -11,16 +12,38 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from . import wifi as wf
 from .analysis import (Measurement, Smoother, SpectrumAverager,
-                       format_status, measure_all)
-from .channels import Channel
-from .sweep import DeviceInfo, Frame, FrequencyGrid, SweepReader, SweepSettings
+                       auto_search_halfwidth, format_status, measure_all)
+from .channels import GROUPS, Channel, group_of, parse_channels
+from .sweep import (DeviceInfo, DeviceStatus, Frame, FrequencyGrid, SweepReader,
+                    SweepSettings)
 
 ESPRESSIF_VID = 0x303A
 
-# Channel colours in --channels order: E2 red, E1 green, F3 blue, F5 yellow
-# with the default channels; a 5th/6th channel gets purple/cyan.
+# Channel colours by frequency, lowest first: red, green, blue, yellow (as on
+# the LCD); a 5th/6th channel gets purple/cyan.
 CH_COLORS = ["#ff5f56", "#45d97a", "#4aa8ff", "#ffbd2e", "#c678dd", "#00d0c0"]
+PANEL_BG = "#16161d"
+WIFI_DIRECT = "#ff3b30"
+WIFI_IMD = "#ffd23f"
+
+
+def rank_colors(channels: list[Channel]) -> list[str]:
+    """Each channel's colour: its rank by frequency."""
+    order = sorted(range(len(channels)), key=lambda i: (channels[i].freq_mhz, i))
+    out = [""] * len(channels)
+    for rank, i in enumerate(order):
+        out[i] = CH_COLORS[rank % len(CH_COLORS)]
+    return out
+
+
+def blend(fg: str, bg: str, a: float) -> str:
+    """fg over bg at opacity a, as #rrggbb."""
+    f, b = QtGui.QColor(fg), QtGui.QColor(bg)
+    mix = [round(bb + a * (ff - bb)) for ff, bb in
+           ((f.red(), b.red()), (f.green(), b.green()), (f.blue(), b.blue()))]
+    return "#%02x%02x%02x" % tuple(mix)
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False,
                     background="#0e0e12", foreground="#c8c8d4")
@@ -45,6 +68,7 @@ def _lut() -> np.ndarray:
 class ViewOptions:
     bw_marks_mhz: tuple[float, ...] = (9.0, 17.0)
     search_mhz: float = 8.0
+    search_request_mhz: float = 8.0   # before narrowing to the channel spacing
     min_snr_db: float = 18.0
     noise_margin_db: float = 3.0
     min_bw_mhz: float = 0.0
@@ -160,17 +184,24 @@ def format_deviation(offset_mhz: float) -> str:
 
 
 class ChannelReadout(QtWidgets.QFrame):
-    """Big live readout of one channel: measured centre and its deviation."""
+    """Live readout of one channel. The deviation is the point: large, in its
+    colour, on a panel tinted the same way; the measured centre below it.
+    A click zooms the sweep into this channel (and back)."""
 
     def __init__(self, ch: Channel, color: str, ok_mhz: float = 0.5,
-                 warn_mhz: float = 1.0, parent=None):
+                 warn_mhz: float = 1.0, on_click: Callable[[str], None] | None = None,
+                 parent=None):
         super().__init__(parent)
+        self.ch = ch
+        self.color = color
         self.ok_mhz = ok_mhz
         self.warn_mhz = warn_mhz
+        self._on_click = on_click
+        self._tint = None
         self.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
-            f"QFrame {{ background: #16161d; border: 1px solid {color}; "
-            f"border-radius: 6px; }}")
+        self._set_tint(None)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("click: sweep only this channel (click again: ALL)")
         mono = QtGui.QFont("Consolas")
         mono.setStyleHint(QtGui.QFont.StyleHint.Monospace)
 
@@ -185,31 +216,31 @@ class ChannelReadout(QtWidgets.QFrame):
         self.title = QtWidgets.QLabel(f"{ch.name}  <span style='color:#8a8a9a'>"
                                       f"{ch.freq_mhz:.0f} MHz</span>")
         self.title.setFont(font(13, True))
-        self.title.setStyleSheet(f"color: {color}; border: none;")
+        self.title.setStyleSheet(f"color: {color}; border: none; background: transparent;")
         title = self.title
 
-        self.centre = QtWidgets.QLabel("----.-- MHz")
-        self.centre.setFont(font(22, True))
-        self.centre.setStyleSheet("color: #f0f0f6; border: none;")
-
-        self.dev = QtWidgets.QLabel("Δ     --")
-        self.dev.setFont(font(15, True))
-        self.dev.setStyleSheet(f"color: {DEV_IDLE_COLOR}; border: none;")
+        self.dev = QtWidgets.QLabel("NO SIGNAL")
+        self.dev.setFont(font(22, True))
+        self.dev.setStyleSheet(f"color: {DEV_IDLE_COLOR}; border: none; background: transparent;")
         self.dev.setToolTip(
             f"deviation from nominal: blue <= {ok_mhz:.2f} MHz, "
             f"yellow below {warn_mhz:.2f} MHz, red from there on")
+
+        self.centre = QtWidgets.QLabel("----.-- MHz")
+        self.centre.setFont(font(13, True))
+        self.centre.setStyleSheet("color: #a0a0b0; border: none; background: transparent;")
 
         self.level = QtWidgets.QLabel("peak  --   SNR  --")
         self.bw = QtWidgets.QLabel("-3 dB  --   -20 dB  --")
         self.info = QtWidgets.QLabel("")
         for lab in (self.level, self.bw, self.info):
             lab.setFont(font(9))
-            lab.setStyleSheet("color: #a0a0b0; border: none;")
+            lab.setStyleSheet("color: #a0a0b0; border: none; background: transparent;")
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(10, 6, 10, 6)
         lay.setSpacing(1)
-        for w in (title, self.centre, self.dev, self.level, self.bw, self.info):
+        for w in (title, self.dev, self.centre, self.level, self.bw, self.info):
             # Ignored width policy: the panel may be squeezed below the text
             # width, and resizeEvent shrinks the font to match.
             w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
@@ -218,6 +249,21 @@ class ChannelReadout(QtWidgets.QFrame):
         self.setMinimumWidth(130)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
                            QtWidgets.QSizePolicy.Policy.Maximum)
+
+    def _set_tint(self, dev_color: str | None) -> None:
+        """Panel background: the deviation's colour, faint; plain without a signal."""
+        if dev_color == self._tint and self.styleSheet():
+            return
+        self._tint = dev_color
+        bg = blend(dev_color, PANEL_BG, 0.22) if dev_color else PANEL_BG
+        self.setStyleSheet(
+            f"ChannelReadout {{ background: {bg}; border: 2px solid {self.color}; "
+            f"border-radius: 6px; }}")
+
+    def mousePressEvent(self, event) -> None:
+        if self._on_click is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._on_click(self.ch.name)
+        super().mousePressEvent(event)
 
     def resizeEvent(self, event) -> None:
         """Scale the text with the panel, so four of them fit any width."""
@@ -233,8 +279,8 @@ class ChannelReadout(QtWidgets.QFrame):
         self.info.setVisible(w >= 150)
         self.bw.setVisible(w >= 110)
         self.title.setFont(sized(13.0, 7, 13, True))
-        self.centre.setFont(sized(9.5, 9, 22, True))
-        self.dev.setFont(sized(14.0, 8, 15, True))
+        self.dev.setFont(sized(8.0, 10, 26, True))
+        self.centre.setFont(sized(14.0, 8, 14, True))
         # 30 monospace characters have to fit: "peak  -48.1 dBm   SNR 46.2 dB"
         for lab in (self.level, self.bw, self.info):
             lab.setFont(sized(26.0, 6, 9, False))
@@ -243,12 +289,11 @@ class ChannelReadout(QtWidgets.QFrame):
         floor = f"{m.floor_dbm:6.1f}" if np.isfinite(m.floor_dbm) else "   --"
         if m.present and smoothed is not None:
             offset = smoothed - m.nominal_mhz
+            col = deviation_color(offset, self.ok_mhz, self.warn_mhz)
+            self._set_tint(col)
+            self.dev.setText(format_deviation(offset))
+            self.dev.setStyleSheet(f"color: {col}; border: none; background: transparent;")
             self.centre.setText(f"{smoothed:8.2f} MHz")
-            self.centre.setStyleSheet("color: #f0f0f6; border: none;")
-            self.dev.setText(f"Δ {format_deviation(offset):>9}")
-            self.dev.setStyleSheet(
-                f"color: {deviation_color(offset, self.ok_mhz, self.warn_mhz)};"
-                " border: none;")
             self.level.setText(
                 f"peak {m.peak_dbm:7.1f} dBm   SNR {m.snr_db:5.1f} dB")
             b3 = f"{m.bw_db3_mhz:5.1f}" if m.bw_db3_mhz is not None else "  --"
@@ -256,11 +301,12 @@ class ChannelReadout(QtWidgets.QFrame):
             self.bw.setText(f"-3 dB {b3}   -20 dB {b20} MHz")
             self.info.setText(f"floor {floor} dBm")
         else:
+            self._set_tint(None)
+            weak = m.reason.startswith("SNR") and np.isfinite(m.snr_db) and m.snr_db >= 6.0
+            self.dev.setText("WEAK" if weak else "NO SIGNAL")
+            self.dev.setStyleSheet(f"color: {DEV_IDLE_COLOR}; border: none; background: transparent;")
             self.centre.setText(f"{smoothed:8.2f} MHz" if smoothed is not None
                                 else "----.-- MHz")
-            self.centre.setStyleSheet("color: #5a5a68; border: none;")
-            self.dev.setText("Δ     --")
-            self.dev.setStyleSheet(f"color: {DEV_IDLE_COLOR}; border: none;")
             # Say what the strongest thing in the window was and why it was
             # rejected, so a real carrier that misses a threshold is visible.
             if m.peak_mhz is not None and np.isfinite(m.peak_dbm):
@@ -270,6 +316,247 @@ class ChannelReadout(QtWidgets.QFrame):
                 self.level.setText("peak        --")
             self.bw.setText(f"no signal: {m.reason}")
             self.info.setText(f"floor {floor} dBm")
+
+
+class WifiMap(QtWidgets.QWidget):
+    """The group's channels (17 MHz each) and the Wi-Fi channels checked:
+    grey not yet, dark nothing heard, red Direct / yellow IMD, fainter the
+    weaker the Wi-Fi signal."""
+
+    LO, HI = 5490.0, 5900.0
+
+    def __init__(self, names, freqs, colors, checks, half_mhz, parent=None):
+        super().__init__(parent)
+        self.names, self.freqs, self.colors = names, freqs, colors
+        self.checks, self.half = checks, half_mhz
+        self.heard: dict = {}
+        self.current: int | None = None
+        self.setMinimumHeight(86)
+
+    def _x(self, mhz: float) -> float:
+        return 8 + (mhz - self.LO) / (self.HI - self.LO) * (self.width() - 16)
+
+    def paintEvent(self, event) -> None:
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtGui.QColor("#0e0e12"))
+        small = QtGui.QFont("Consolas", 8)
+        p.setFont(small)
+        y_grp, h_grp = 4, 34
+        for name, f, col in zip(self.names, self.freqs, self.colors):
+            x0, x1 = self._x(f - self.half), self._x(f + self.half)
+            c = QtGui.QColor(blend(col, "#0e0e12", 0.35))
+            p.fillRect(QtCore.QRectF(x0, y_grp + 14, x1 - x0, h_grp - 14), c)
+            p.setPen(QtGui.QColor(col))
+            p.drawLine(QtCore.QPointF(self._x(f), y_grp + 14), QtCore.QPointF(self._x(f), y_grp + h_grp))
+            p.drawText(QtCore.QRectF(self._x(f) - 20, y_grp, 40, 14),
+                       QtCore.Qt.AlignmentFlag.AlignCenter, name)
+        y_w, h_w = y_grp + h_grp + 3, 18
+        for r in self.checks:
+            f = wf.wifi_mhz(r.ch)
+            x0, x1 = self._x(f - 10) + 1, self._x(f + 10) - 1
+            h = self.heard.get(r.ch)
+            if h is None:
+                fill, text = QtGui.QColor("#0e0e12"), QtGui.QColor("#8a8a9a")
+            elif not h.frames:
+                fill, text = QtGui.QColor("#2a2a36"), QtGui.QColor("#8a8a9a")
+            else:
+                a = wf.strength(h.rssi_max, 0.25)
+                fill = QtGui.QColor(blend(WIFI_DIRECT if r.direct else WIFI_IMD, "#0e0e12", a))
+                text = QtGui.QColor("#0e0e12" if a > 0.6 else "#f0f0f6")
+            rect = QtCore.QRectF(x0, y_w, x1 - x0, h_w)
+            p.fillRect(rect, fill)
+            p.setPen(QtGui.QColor("#f0f0f6" if r.ch == self.current else "#262632"))
+            p.drawRect(rect)
+            p.setPen(text)
+            p.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, str(r.ch))
+        p.setPen(QtGui.QColor("#8a8a9a"))
+        y_a = y_w + h_w + 2
+        for f in range(5500, 5901, 50):
+            x = self._x(f)
+            p.drawLine(QtCore.QPointF(x, y_a), QtCore.QPointF(x, y_a + 3))
+            p.drawText(QtCore.QRectF(x - 20, y_a + 3, 40, 14), QtCore.Qt.AlignmentFlag.AlignCenter, str(f))
+        p.end()
+
+
+class WifiDialog(QtWidgets.QDialog):
+    """Wi-Fi check of the group shown: listen (receive only, through the LCD
+    firmware's FPV WIFI) on every Wi-Fi channel that can hurt it, then say
+    per FPV channel: OK, Direct (a Wi-Fi signal on it) or IMD."""
+
+    def __init__(self, win: "BandMonitorWindow"):
+        super().__init__(win)
+        self.win = win
+        self.names = [c.name for c in win.channels]
+        self.freqs = [c.freq_mhz for c in win.channels]
+        self.colors = list(win.colors)
+        half = max(win.opts.bw_marks_mhz) / 2.0 if win.opts.bw_marks_mhz else 8.5
+        self.checks = wf.channels_to_check(self.freqs, half)
+        self.heard: dict[int, wf.Heard] = {}
+        self.aps: list[wf.Ap] = []
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread = None
+        self._halt = threading.Event()
+        self.setWindowTitle(f"WiFi check - {win.group_name or 'custom'}")
+        self.resize(760, 360)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        self.map = WifiMap(self.names, self.freqs, self.colors, self.checks, half)
+        lay.addWidget(self.map)
+        grid = QtWidgets.QGridLayout()
+        mono = QtGui.QFont("Consolas", 11)
+        self.rows = []
+        for k, (name, f, col) in enumerate(zip(self.names, self.freqs, self.colors)):
+            lab = QtWidgets.QLabel(f"{name}  <span style='color:#8a8a9a'>{f:.0f}</span>")
+            lab.setFont(QtGui.QFont("Consolas", 14, QtGui.QFont.Weight.Bold))
+            lab.setStyleSheet(f"color: {col};")
+            kind = QtWidgets.QLabel("...")
+            kind.setFont(QtGui.QFont("Consolas", 14, QtGui.QFont.Weight.Bold))
+            kind.setMinimumWidth(90)
+            detail = QtWidgets.QLabel("")
+            detail.setFont(mono)
+            grid.addWidget(lab, k, 0)
+            grid.addWidget(kind, k, 1)
+            grid.addWidget(detail, k, 2)
+            self.rows.append((kind, detail))
+        grid.setColumnStretch(2, 1)
+        lay.addLayout(grid)
+        bottom = QtWidgets.QHBoxLayout()
+        self.status = QtWidgets.QLabel("")
+        self.status.setStyleSheet("color: #8a8a9a;")
+        self.btn_scan = QtWidgets.QPushButton("Scan")
+        self.btn_scan.clicked.connect(self._scan_or_stop)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        bottom.addWidget(self.status, 1)
+        bottom.addWidget(self.btn_scan)
+        bottom.addWidget(btn_close)
+        lay.addLayout(bottom)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._poll)
+        self.timer.start(100)
+        self._show()
+        self._start()
+
+    # -- scanning -----------------------------------------------------------
+    def _start(self) -> None:
+        if self._thread is not None or not self.checks:
+            return
+        self.heard.clear()
+        self.aps.clear()
+        self._halt.clear()
+        self.win.pause_receiver()            # the port is needed for FPV WIFI
+        port = self.win.settings.port
+        checks = [r.ch for r in self.checks]
+        self._thread = threading.Thread(target=self._run, args=(port, checks), daemon=True)
+        self._thread.start()
+        self.btn_scan.setText("Stop")
+
+    def _run(self, port, checks) -> None:
+        from .fpv_link import FpvLink, FpvLinkError
+        link = None
+        try:
+            for attempt in range(15):           # the receiver may still hold the port
+                try:
+                    link = FpvLink(port)
+                    break
+                except FpvLinkError as e:
+                    if attempt == 14:
+                        raise
+                    if "FPV" in str(e) and "no answer" in str(e):
+                        raise FpvLinkError("the device did not answer FPV? - "
+                                           "the Wi-Fi check needs the LCD firmware") from None
+                    time.sleep(0.2)
+            for ch in checks:
+                if self._halt.is_set():
+                    break
+                self._q.put(("current", ch))
+                head, aps = link.wifi(ch, wf.DWELL_MS)
+                self._q.put(("heard", wf.parse_listen(head, aps)))
+            self._q.put(("done", None))
+        except Exception as e:
+            self._q.put(("done", str(e)))
+        finally:
+            if link is not None:
+                link.close()
+
+    def _poll(self) -> None:
+        changed = False
+        while True:
+            try:
+                kind, val = self._q.get_nowait()
+            except queue.Empty:
+                break
+            changed = True
+            if kind == "current":
+                self.map.current = val
+            elif kind == "heard":
+                self.heard[val.ch] = val
+                for a in val.aps:
+                    if all(b.bssid != a.bssid for b in self.aps):
+                        self.aps.append(a)
+            elif kind == "done":
+                self._finish(val)
+        if changed:
+            self._show()
+
+    def _finish(self, error) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._thread = None
+        self.map.current = None
+        self.btn_scan.setText("Scan")
+        self.win.resume_receiver()
+        if error:
+            self.status.setText("error: " + error)
+            self.status.setStyleSheet("color: #ff5f56;")
+
+    def _scan_or_stop(self) -> None:
+        if self._thread is not None:
+            self._halt.set()
+        else:
+            self.status.setStyleSheet("color: #8a8a9a;")
+            self._start()
+
+    def _show(self) -> None:
+        self.map.heard = self.heard
+        self.map.update()
+        done = len(self.heard)
+        if self._thread is not None:
+            self.status.setText(f"listening (receive only) ch {self.map.current or ''}  "
+                                f"{done}/{len(self.checks)} - sweeping is paused")
+        elif not self.status.text().startswith("error"):
+            self.status.setText(f"{len(self.checks)} Wi-Fi channels can reach this group; "
+                                f"{done} checked")
+        for (kind, detail), v in zip(self.rows, wf.verdicts(self.names, self.checks,
+                                                             self.heard, self.aps)):
+            kind.setText(v.kind)
+            if v.kind == "OK":
+                kind.setStyleSheet("color: #45d97a;")
+                detail.setText("")
+                continue
+            if v.kind == "...":
+                kind.setStyleSheet("color: #5a5a68;")
+                detail.setText("")
+                continue
+            base = WIFI_DIRECT if v.kind == "Direct" else WIFI_IMD
+            kind.setStyleSheet(f"color: {blend(base, '#0e0e12', wf.strength(v.rssi, 0.4))};")
+            text = f"ch{v.ch} {wf.wifi_mhz(v.ch)}"
+            if v.how:
+                text += f"  {v.how}"
+            text += f"  {v.rssi} dBm  {v.ssid or '(no beacon heard)'}"
+            if v.more:
+                text += f"  +{v.more} more"
+            detail.setText(text)
+
+    def closeEvent(self, event) -> None:
+        self.timer.stop()
+        if self._thread is not None:
+            self._halt.set()
+            self._thread.join(timeout=wf.DWELL_MS / 1000.0 + 4.0)
+            self._thread = None
+            self.win.resume_receiver()
+        super().closeEvent(event)
 
 
 class PortCombo(QtWidgets.QComboBox):
@@ -302,6 +589,11 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.device_title = title
         self.channels = channels
+        self.colors = rank_colors(channels)
+        self.group_name = group_of(channels)     # None: custom --channels
+        self._clip = 0                            # firmware: saturated samples per mille
+        self._paused_for_wifi = False
+        self._marker_items: list[tuple] = []
         self.settings = settings
         self.grid = grid
         self.source_factory = source_factory
@@ -414,15 +706,22 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
             plot.vb.disableAutoRange(pg.ViewBox.XAxis)
             plot.vb.setLimits(xMin=self.grid.start_mhz, xMax=self.grid.stop_mhz)
 
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(6)
+        self.readout_row = QtWidgets.QHBoxLayout()
+        self.readout_row.setSpacing(6)
         self.readouts: dict[str, ChannelReadout] = {}
-        for i, ch in enumerate(self.channels):
-            ro = ChannelReadout(ch, CH_COLORS[i % len(CH_COLORS)],
-                                self.opts.dev_ok_mhz, self.opts.dev_warn_mhz)
+        self._build_readouts()
+        root.addLayout(self.readout_row)
+
+    def _build_readouts(self) -> None:
+        for ro in self.readouts.values():
+            self.readout_row.removeWidget(ro)
+            ro.deleteLater()
+        self.readouts = {}
+        for ch, color in zip(self.channels, self.colors):
+            ro = ChannelReadout(ch, color, self.opts.dev_ok_mhz, self.opts.dev_warn_mhz,
+                                on_click=self._readout_clicked)
             self.readouts[ch.name] = ro
-            row.addWidget(ro)
-        root.addLayout(row)
+            self.readout_row.addWidget(ro)
 
     def _build_toolbar(self) -> QtWidgets.QLayout:
         bar = FlowLayout(spacing=6)
@@ -553,37 +852,60 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         self.hint = label(f"marks:  {shades}   dotted = hop LOs")
         hint = self.hint
 
-        # Sweep span: one button per channel (its centre +- margin, a few
-        # hops, so several times faster) plus ALL for the starting span.
-        span_widgets = []
+        # Groups (as on the LCD): the channels shown; each has its Wi-Fi check.
+        group_widgets = []
+        self.group_buttons: dict[str, QtWidgets.QPushButton] = {}
         if self.opts.span_planner is not None:
-            self.span_group = QtWidgets.QButtonGroup(self)
-            self.span_group.setExclusive(True)
-            span_widgets.append(label("Span"))
-            for i, name in enumerate([c.name for c in self.channels] + ["ALL"]):
+            self.grp_group = QtWidgets.QButtonGroup(self)
+            self.grp_group.setExclusive(True)
+            group_widgets.append(label("Group"))
+            for name, spec in GROUPS.items():
                 b = QtWidgets.QPushButton(name)
                 b.setCheckable(True)
-                b.setChecked(name == "ALL")
+                b.setChecked(name == self.group_name)
                 b.setMinimumWidth(44)
-                if name != "ALL":
-                    color = CH_COLORS[i % len(CH_COLORS)]
-                    b.setStyleSheet(f"QPushButton:checked {{ background: {color};"
-                                    " color: #101018; font-weight: bold; }")
-                else:
-                    b.setStyleSheet("QPushButton:checked { background: #d8d8e4;"
-                                    " color: #101018; font-weight: bold; }")
-                b.clicked.connect(lambda _=False, n=name: self._select_span(n))
-                self.span_group.addButton(b)
-                span_widgets.append(b)
-            span_widgets.append(label("|"))
+                b.setToolTip(spec.replace(",", " "))
+                b.setStyleSheet("QPushButton:checked { background: #d8d8e4;"
+                                " color: #101018; font-weight: bold; }")
+                b.clicked.connect(lambda _=False, n=name: self._select_group(n))
+                self.grp_group.addButton(b)
+                self.group_buttons[name] = b
+                group_widgets.append(b)
+            self.btn_wifi = QtWidgets.QPushButton("WiFi check")
+            self.btn_wifi.setToolTip(
+                "Listen (receive only) on the Wi-Fi channels that can hurt this "
+                "group: Direct = on a channel, IMD = a 3rd-order product with a "
+                "VTX lands on one. Needs the LCD firmware; sweeping pauses meanwhile.")
+            self.btn_wifi.clicked.connect(self._open_wifi)
+            group_widgets += [self.btn_wifi, label("|")]
+
+        # Sweep span: one button per channel of the group (its centre +-
+        # margin, a few hops, so several times faster) plus ALL.
+        span_widgets = []
+        if self.opts.span_planner is not None:
+            self.span_box = QtWidgets.QWidget()
+            self.span_box_lay = QtWidgets.QHBoxLayout(self.span_box)
+            self.span_box_lay.setContentsMargins(0, 0, 0, 0)
+            self.span_box_lay.setSpacing(6)
+            self.span_buttons: dict[str, QtWidgets.QPushButton] = {}
+            self._build_span_buttons()
+            span_widgets += [label("Span"), self.span_box, label("|")]
+
+        # The ADC saturates (too much gain, or a VTX very close): LCD firmware only.
+        self.sat_label = QtWidgets.QLabel("")
+        self.sat_label.setStyleSheet("background: #ff3030; color: #f0f0f6;"
+                                     " font-weight: bold; padding: 1px 6px;")
+        self.sat_label.setToolTip("the ADC clips: lower the gain")
+        self.sat_label.setVisible(False)
 
         rx_widgets = []
         if rc is not None:
             rx_widgets = [label("Rx"), *self.rx_buttons.values(), self.rx_label,
                           self.chk_nolcd, label("|")]
         for w in (label("Port"), self.cmb_port, self.btn_connect,
-                  self.conn_label, label("|"), *rx_widgets,
+                  self.conn_label, label("|"), *rx_widgets, *group_widgets,
                   *span_widgets, label("Gain idx"), self.spin_gain, btn_apply,
+                  self.sat_label,
                   self.btn_pause, self.chk_hold, btn_clear, self.chk_hops,
                   label("| detect SNR >="), self.spin_snr,
                   label("| Y"), self.chk_y_auto, self.spin_y_min,
@@ -597,6 +919,8 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
             for w in (self.spin_gain, btn_apply, self.cmb_port, self.chk_nolcd,
                       *self.rx_buttons.values()):
                 w.setEnabled(False)
+            if self.opts.span_planner is not None:
+                self.btn_wifi.setEnabled(False)
         return bar
 
     # --------------------------------------------------------------- port --
@@ -688,10 +1012,18 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
     def _build_markers(self) -> None:
         """Band-width shading and centre lines, on both plots."""
         self._build_hop_lines()
+        for plot, item in self._marker_items:
+            plot.removeItem(item)
+        self._marker_items = []
+
+        def add(plot, item):
+            plot.addItem(item)
+            self._marker_items.append((plot, item))
+
         self.line_measured: dict[str, list[pg.InfiniteLine]] = {}
         marks = sorted(self.opts.bw_marks_mhz, reverse=True)  # widest first
-        for i, ch in enumerate(self.channels):
-            color = QtGui.QColor(CH_COLORS[i % len(CH_COLORS)])
+        for ch, ch_color in zip(self.channels, self.colors):
+            color = QtGui.QColor(ch_color)
             for depth, bw in enumerate(marks):
                 alpha = 26 + depth * 26
                 brush = QtGui.QColor(color)
@@ -706,7 +1038,7 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
                         pen=pg.mkPen(pen, width=1,
                                      style=QtCore.Qt.PenStyle.DashLine))
                     region.setZValue(-20 - depth)
-                    plot.addItem(region)
+                    add(plot, region)
             # Nominal centre.
             for plot in (self.p_spec, self.p_wf):
                 nominal = pg.InfiniteLine(
@@ -714,7 +1046,7 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
                     pen=pg.mkPen(color, width=1,
                                  style=QtCore.Qt.PenStyle.DotLine))
                 nominal.setZValue(-10)
-                plot.addItem(nominal)
+                add(plot, nominal)
             # Measured centre (moves).
             lines = []
             label_opts = {"position": 0.95, "color": color.name(),
@@ -726,7 +1058,7 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
                     label=(f"{ch.name} ----.--" if with_label else None),
                     labelOpts=label_opts if with_label else None)
                 line.setZValue(10)
-                plot.addItem(line)
+                add(plot, line)
                 lines.append(line)
             self.line_measured[ch.name] = lines
 
@@ -881,10 +1213,78 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
         self.p_spec.setXRange(self.grid.start_mhz, self.grid.stop_mhz, padding=0)
         self._build_hop_lines()
 
+    def _build_span_buttons(self) -> None:
+        for b in self.span_buttons.values():
+            self.span_box_lay.removeWidget(b)
+            b.deleteLater()
+        self.span_buttons = {}
+        self.span_group = QtWidgets.QButtonGroup(self)
+        self.span_group.setExclusive(True)
+        for name, color in [(c.name, col) for c, col in zip(self.channels, self.colors)] + [("ALL", "#d8d8e4")]:
+            b = QtWidgets.QPushButton(name)
+            b.setCheckable(True)
+            b.setChecked(name == self._span_name)
+            b.setMinimumWidth(44)
+            b.setStyleSheet(f"QPushButton:checked {{ background: {color};"
+                            " color: #101018; font-weight: bold; }")
+            b.clicked.connect(lambda _=False, n=name: self._select_span(n))
+            self.span_group.addButton(b)
+            self.span_box_lay.addWidget(b)
+            self.span_buttons[name] = b
+        self.span_box.adjustSize()
+
+    def _readout_clicked(self, name: str) -> None:
+        """A card zooms into its channel; the same card again goes back to ALL."""
+        if self.opts.span_planner is None:
+            return
+        self._select_span("ALL" if self._span_name == name else name)
+
+    def _select_group(self, name: str) -> None:
+        """Show another group: its channels, colours, cards and span."""
+        if name == self.group_name and self.channels:
+            return
+        self.group_name = name
+        self.channels = parse_channels(GROUPS[name])
+        self.colors = rank_colors(self.channels)
+        self.opts.search_mhz = auto_search_halfwidth(self.channels,
+                                                     self.opts.search_request_mhz)
+        half = self.opts.channel_span_half_mhz
+        freqs = [c.freq_mhz for c in self.channels]
+        self._full_span = (min(freqs) - half, max(freqs) + half)
+        self._span_name = "ALL"
+        rc = self.opts.receiver
+        if rc is not None:
+            self.source_factory = rc.source_factory(self.channels)
+        self._stop_reader()
+        self._replan(*self._full_span)
+        self._build_markers()
+        self._build_readouts()
+        self._build_span_buttons()
+        self._start_reader()
+        self.status.setText(f"group {name}: " + " ".join(c.name for c in self.channels))
+
+    def pause_receiver(self) -> None:
+        """Free the port (the Wi-Fi check talks to the device itself)."""
+        self._paused_for_wifi = self.reader is not None
+        self._stop_reader()
+        if self._paused_for_wifi:
+            self._set_conn_state("connecting", "paused: WiFi check")
+
+    def resume_receiver(self) -> None:
+        if self._paused_for_wifi and self._want_connected:
+            self._restart_reader()
+        self._paused_for_wifi = False
+
+    def _open_wifi(self) -> None:
+        dlg = WifiDialog(self)
+        dlg.show()
+
     def _select_span(self, name: str) -> None:
         """Sweep one channel (centre +- margin) or ALL (the starting span)."""
         if name == self._span_name:
             return
+        if name in getattr(self, "span_buttons", {}):
+            self.span_buttons[name].setChecked(True)
         if name == "ALL":
             start, stop = self._full_span
         else:
@@ -989,6 +1389,13 @@ class BandMonitorWindow(QtWidgets.QMainWindow):
             if isinstance(item, DeviceInfo):
                 self._set_conn_state("connected", f"connected {item.port}",
                                      f"{item.port}: {item.identity}")
+                continue
+            if isinstance(item, DeviceStatus):
+                self._clip = item.clip_permille
+                sat = self._clip >= 10
+                self.sat_label.setVisible(sat)
+                if sat:
+                    self.sat_label.setText(f"SAT {(self._clip + 5) // 10}%")
                 continue
             if isinstance(item, Exception):
                 # Not reachable at start-up, or unplugged: drop to the

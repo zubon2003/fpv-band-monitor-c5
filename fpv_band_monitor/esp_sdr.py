@@ -41,7 +41,7 @@ from typing import Iterator
 
 import numpy as np
 
-from .sweep import HZ, DeviceInfo, SpanLine, SweepSettings
+from .sweep import HZ, DeviceInfo, DeviceStatus, SpanLine, SweepSettings
 
 ESPRESSIF_VID = 0x303A
 # Rate index of CAP16/CAP20 -> nominal complex sample rate.
@@ -505,6 +505,8 @@ def _receiver_process(es: EspSettings, s: SweepSettings,
         for line in src(s, stop):
             if isinstance(line, DeviceInfo):
                 out.put(("open", line.port, line.identity))
+            elif isinstance(line, DeviceStatus):
+                out.put(("status", line.clip_permille))
             else:
                 out.put((line.hz_low, line.bin_width, line.powers))
     except Exception as e:
@@ -544,17 +546,24 @@ def process_source(es: EspSettings, sim_carriers: list | None = None):
                 if item[0] == "open":
                     yield DeviceInfo(item[1], item[2])
                     continue
+                if item[0] == "status":
+                    yield DeviceStatus(item[1])
+                    continue
                 yield SpanLine(*item)
         finally:
             child_stop.set()
-            # Unblock a child stuck on a full queue, then give it a moment to
-            # release the port cleanly before forcing it.
-            try:
-                while True:
-                    out.get_nowait()
-            except Exception:
-                pass
-            proc.join(timeout=2.0)
+            # Keep draining until the child has gone: it may still put a sweep
+            # or two before it sees the stop, and a child cannot exit while
+            # its queue's feeder thread waits on a full pipe. Killing it there
+            # skips its STREAM OFF, and the device then streams to nobody.
+            deadline = time.monotonic() + 5.0
+            while proc.is_alive() and time.monotonic() < deadline:
+                try:
+                    while True:
+                        out.get_nowait()
+                except Exception:
+                    pass
+                proc.join(timeout=0.05)
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=1.0)

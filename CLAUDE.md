@@ -14,12 +14,21 @@
 - `gui.py`：ツールバーに **Rx: auto / iq / fft** ボタンと **No LCD**。切り替えると受信を止め、方式を決め直し、ビン幅が変われば `_replan()` で格子を作り直す。
 - ユーザーの指定：「PC 側はどちらでも使えるように。基本は auto で fft を受け取る。だめなら iq。ボタンで auto / iq / fft を選べる。nolcd を送ったら LCD 表示をせず全力で FFT」。（一度「新ファームのみ」にして、すぐ取り消した経緯がある：コミット 056b2d1 → revert 4585539。）
 
+## 液晶版に合わせた機能（2026-10-14）
+
+- グループ（`channels.GROUPS`、ツールバー Group）で実行中にチャンネルの組を切り替える（`_select_group`：readouts・markers・span ボタンを作り直し、`_replan`）。色は周波数順（`rank_colors`）。
+- カードはずれが主役＋地をずれの色、クリックでそのチャンネルの Span（もう一度で ALL）。WEAK は SNR 6 dB 以上のときだけ。
+- `wifi.py`：Direct / IMD の事前計算（液晶版 `scan_prepare` と同じ結果をテストで確認）、`FPV WIFI` の解析、判定、RSSI による濃さ。`gui.WifiDialog` は受信を止めて（`pause_receiver`）自分でポートを開き、終われば `resume_receiver`。
+- `fw_source` が 1 秒ごとに `FPV STATE?` の `clip` を読み `DeviceStatus` を流す（子プロセス経由）→ ツールバーの SAT。`clip` が無い古いファームでは止める。
+- 実機（COM18、液晶版ファーム）で WiFi check を確認：18 ch で 22 秒、終了後に受信再開。
+- グループ切替で接続が切れた件（2026-10-14 修正）：①子プロセスがキューの満杯で終われず 2 s で kill → STREAM OFF が届かずファームが送り続け、次の `FPV?` が遅れる。親は子が終わるまでキューを抜き続ける（5 s）。②`SWEEP ` がペイロード内の改行の後ろにくっつくと二度と同期しない → 行中の `SWEEP ` から読み直す（tests/test_framing.py）。③`next_sweep` はデータが来続けても時間で戻る、ストリーム中の readline は 0.3 s。④`FPV?` は 3 回まで聞き直す。実機で 12 回切替して全部 1.0〜1.4 s で再開。
+
 ## テスト
 
 ```
 QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests
 ```
-31 件。`tests/test_fpv_link.py` は疑似端末（pty、Linux/macOS のみ）で偽ファームと通信する。ファーム側の結合テストは `fpv-lcd/tests/fpv_host/check_link.py <このリポジトリ>`。
+34 件（Windows で test_fpv_link を除く。test_wifi.py・test_framing.py を追加）。`tests/test_fpv_link.py` は疑似端末（pty、Linux/macOS のみ）で偽ファームと通信する。ファーム側の結合テストは `fpv-lcd/tests/fpv_host/check_link.py <このリポジトリ>`。
 
 ## 実機での確認（2026-10-09〜10）
 

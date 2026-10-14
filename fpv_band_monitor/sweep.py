@@ -44,6 +44,13 @@ class DeviceInfo:
     identity: str
 
 
+@dataclass
+class DeviceStatus:
+    """Polled from the LCD firmware: saturated ADC samples per mille (worst hop)."""
+
+    clip_permille: int
+
+
 # --------------------------------------------------------------------------- #
 # Frequency grid
 # --------------------------------------------------------------------------- #
@@ -133,7 +140,7 @@ class SweepReader:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 3.0) -> None:
+    def stop(self, timeout: float = 7.0) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
@@ -149,8 +156,8 @@ class SweepReader:
             for line in self._source(self.settings, self._stop):
                 if self._stop.is_set():
                     break
-                if isinstance(line, DeviceInfo):
-                    self.out.put(line)  # connection report for the GUI
+                if isinstance(line, (DeviceInfo, DeviceStatus)):
+                    self.out.put(line)  # connection / device report for the GUI
                     continue
                 acc.paint(line.hz_low, line.bin_width, line.powers)
                 self.out.put(acc.flush())

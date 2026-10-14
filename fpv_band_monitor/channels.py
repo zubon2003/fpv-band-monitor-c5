@@ -21,6 +21,14 @@ BANDS: dict[str, list[int]] = {
 # The four channels this monitor was built for.
 DEFAULT_CHANNELS = "E2,E1,F3,F5"
 
+# The groups of the LCD firmware (main/fpv/monitor.cpp), in its mode-list order.
+GROUPS: dict[str, str] = {
+    "4CH": "E2,E1,F3,F5",
+    "4CH2": "E1,A8,A5,F5",
+    "4CH3": "R2,F1,R4,R5",
+    "3CH": "E1,F1,F4",
+}
+
 
 @dataclass(frozen=True)
 class Channel:
@@ -63,6 +71,15 @@ def parse_channels(spec: str) -> list[Channel]:
     if not out:
         raise ValueError("no channels given")
     return out
+
+
+def group_of(channels: list[Channel]) -> str | None:
+    """The name of the group these channels are (in any order), or None."""
+    names = sorted(c.name for c in channels)
+    for name, spec in GROUPS.items():
+        if sorted(spec.split(",")) == names:
+            return name
+    return None
 
 
 def format_table() -> str:
