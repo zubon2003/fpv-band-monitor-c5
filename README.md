@@ -15,12 +15,16 @@ HackRF One 版の fpv-band-monitor から C5 専用に切り出したもの。
 **[zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)**（GPL-3.0、[ESPARGOS/esp-sdr](https://github.com/ESPARGOS/esp-sdr) のフォーク）。
 このモニタを XIAO ESP32-C5 単体で動かしたもので、液晶だけでも同じ監視ができる。
 [ファーム書き込みページ](https://zubon2003.github.io/fpv-lcd/) からブラウザで書き込める。
+**液晶が無くても、XIAO ESP32-C5 とこの PC 用ソフトのセットで使える**（下記）。
 
 ## 必要なもの
 
 - **XIAO ESP32-C5**（5GHz 帯を受けられる ESP32 は C5 だけ。C3/C6/S3 などは 2.4GHz のみ）
-- **液晶版ファーム**（[zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)、GPL-3.0）と 3.5" 液晶
-  （Waveshare Pico-ResTouch-LCD-3.5 か 3.5inch Capacitive Touch LCD）
+- **液晶版ファーム**（[zubon2003/fpv-lcd](https://github.com/zubon2003/fpv-lcd)、GPL-3.0）
+- 3.5" 液晶（Waveshare Pico-ResTouch-LCD-3.5 か 3.5inch Capacitive Touch LCD）は**無くてもよい**。
+  液晶なしで PC 用ソフトとだけ使うときは、書き込みページで **3.5" Capacitive Touch LCD** 用を選ぶ
+  （タッチの部品が見つからなければタッチを使わず、校正画面も出ない。ResTouch 用はタッチを SPI で読むので、
+  液晶が無いと不定な値をタッチと取り違えるおそれがある）。電池も無くてよい（USB 給電として動く）
 - Python 3.11 以上（3.13 推奨）。Windows は [python.org](https://www.python.org/downloads/)、
   Mac は python.org のインストーラーか `brew install python@3.13`
   （Mac 標準の `/usr/bin/python3` は 3.9 のことが多く使えない）
